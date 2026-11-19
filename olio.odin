@@ -231,14 +231,42 @@ save_hint :: proc(err: os.Error) -> string {
     }
 }
 
+// Creates and removes a probe file, to tell "this folder refuses writes" apart
+// from "this particular name was refused".
+dir_writable :: proc(dir: string) -> bool {
+    if dir == "" do return false
+    probe := path_join(dir, ".olio-write-probe")
+    defer delete(probe)
+
+    fd, err := os.open(probe, os.O_RDWR | os.O_CREATE | os.O_TRUNC, os.perm(0o644))
+    if err != nil do return false
+    os.close(fd)
+    os.remove(probe)
+    return true
+}
+
+save_reason :: proc(err: os.Error, path: string) -> string {
+    if err != .Permission_Denied do return save_hint(err)
+
+    dir := path_dir(path)
+    if !dir_writable(dir) {
+        return fmt.tprintf(
+            "the folder %s does not accept writes from olio - protected folder, OneDrive lock, no permission, or a security agent blocking this unsigned exe", dir)
+    }
+    if fi, serr := os.stat(path, context.allocator); serr == nil && fi.type != .Directory {
+        return "the file exists but cannot be written - read-only, or open in another program"
+    }
+    return "the folder accepts writes but this name was refused - try another name"
+}
+
 editor_save :: proc() {
-    if E.filename == "" {
+    was_unnamed := len(E.filename) == 0
+    if was_unnamed {
         name := editor_prompt("Save as: %s (ESC to cancel)", nil)
         if name == "" {
             set_status_message("Save aborted")
             return
         }
-        if len(E.filename) > 0 do delete(E.filename)
         E.filename = name
     }
 
@@ -265,7 +293,12 @@ editor_save :: proc() {
 
     fd, err := os.open(path, os.O_RDWR | os.O_CREATE | os.O_TRUNC, os.perm(0o644))
     if err != nil {
-        set_status_message("Can't save %s: %v%s", path_base(path), err, save_hint(err))
+        set_status_message("Can't save %s: %v - %s", path, err, save_reason(err, path))
+        if was_unnamed {
+            // Let Ctrl-S ask for a name again instead of retrying the bad one.
+            delete(E.filename)
+            E.filename = ""
+        }
         return
     }
 
@@ -275,14 +308,14 @@ editor_save :: proc() {
         n, werr := os.write(fd, data[written:])
         if werr != nil {
             os.close(fd)
-            set_status_message("Can't save %s: write failed after %d/%d bytes: %v", path_base(path), written, len(data), werr)
+            set_status_message("Can't save %s: write failed after %d/%d bytes: %v", path, written, len(data), werr)
             return
         }
         if n <= 0 do break
         written += n
     }
     if cerr := os.close(fd); cerr != nil {
-        set_status_message("Can't save %s: flush failed: %v%s", path_base(path), cerr, save_hint(cerr))
+        set_status_message("Can't save %s: flush failed: %v%s", path, cerr, save_hint(cerr))
         return
     }
 
