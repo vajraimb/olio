@@ -66,3 +66,9 @@ get_window_size :: proc(conf: ^Config) -> Result {
 	if _, err := os.write_string(os.stdout, "\x1b[999C\x1b[999B"); err != nil do return .Err
 	return get_cursor_pos(conf)
 }
+
+// The POSIX path has no cheap resize poll (that would need an ioctl or another
+// cursor-position round-trip), so the size captured at startup is kept.
+poll_window_size :: proc() -> (rows, cols: int, ok: bool) {
+	return 0, 0, false
+}

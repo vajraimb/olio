@@ -62,3 +62,18 @@ get_window_size :: proc(conf: ^Config) -> Result {
 	conf.screen_row = height
 	return .Ok
 }
+
+// Cheap resize check, called on every redraw (no escape-sequence round-trip).
+poll_window_size :: proc() -> (rows, cols: int, ok: bool) {
+	_, out := _std_handles()
+	if out == win32.INVALID_HANDLE do return 0, 0, false
+
+	info: win32.CONSOLE_SCREEN_BUFFER_INFO
+	if !win32.GetConsoleScreenBufferInfo(out, &info) do return 0, 0, false
+
+	width  := int(info.srWindow.Right - info.srWindow.Left) + 1
+	height := int(info.srWindow.Bottom - info.srWindow.Top) + 1
+	if width <= 0 || height <= 0 do return 0, 0, false
+
+	return height, width, true
+}

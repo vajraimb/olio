@@ -1,8 +1,9 @@
-olio
+﻿olio
+olio.exe
 *.txt
 *.c
-
-olio.exe
-screenshots/
-tools/scratch/
 __pycache__/
+tools/verify.log
+tools/scratch/demo.odin
+screenshots/**/drive.log
+screenshots/**/drive_crash.log

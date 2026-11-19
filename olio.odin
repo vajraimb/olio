@@ -134,7 +134,7 @@ Hl_Db := []Syntax {
     }
 }
 
-Olio_Version := "0.3.0"
+Olio_Version := "0.4.0"
 Tab_Stop := 4
 Quit_Times := 3
 
@@ -148,15 +148,25 @@ append_row :: proc(line: []byte) {
 
 /*** file IO ***/
 
-editor_open :: proc (path: string) {
-    E.filename = path
-    select_syntax_highlight()
+editor_open :: proc (path: string) -> bool {
     content, err := os.read_entire_file_from_path(path, context.allocator)
+    if err != nil {
+        set_status_message("Cannot open %s", path)
+        return false
+    }
     defer delete(content)
-    if err != nil do die("Failed to read file")
 
-    start := 0 
-    for i := 0; i < len(content); i += 1 {
+    E.filename = strings.clone(path)
+    select_syntax_highlight()
+
+    // Skip a UTF-8 BOM, which Windows editors like to add.
+    file_start := 0
+    if len(content) >= 3 && content[0] == 0xEF && content[1] == 0xBB && content[2] == 0xBF {
+        file_start = 3
+    }
+
+    start := file_start
+    for i := file_start; i < len(content); i += 1 {
         if content[i] == '\n' {
             line := content[start:i]
             if len(line) > 0 && line[len(line)-1] == '\r' do line = line[:len(line)-1]
@@ -170,6 +180,7 @@ editor_open :: proc (path: string) {
         insert_row(E.num_rows, line)
     }
     E.dirty = 0
+    return true
 }
 
 rows_to_string :: proc() -> ([]byte, int) {
@@ -285,8 +296,21 @@ move_cursor :: proc(key: Key) {
 
 quit_times := Quit_Times
 
+request_quit :: proc() {
+    if E.dirty != 0 && quit_times > 0 {
+        set_status_message("WARNING!!! File has unsaved changes. Press Ctrl-Q %d more times to quit.", quit_times)
+        quit_times -= 1
+        return
+    }
+    exit(0)
+}
+
 handle_keypress :: proc() {
-    c := read_key() 
+    c := read_key()
+    if ide_handle_key(c) {
+        quit_times = Quit_Times
+        return
+    }
     switch v in c {
     case Arrow:
         switch v {
@@ -310,17 +334,8 @@ handle_keypress :: proc() {
         switch v {
         case '\r': insert_newline()
         case cntl_key('h'): del_char()
-        case cntl_key('s'): editor_save()
         case cntl_key('l'), '\x1b': 
         case cntl_key('f'): editor_find()
-        case cntl_key('q'): {
-            if E.dirty != 0 && quit_times > 0 {
-                set_status_message("WARNING!!! File has unsaved changes. Press Ctrl-Q %d more times to quit.", quit_times)
-                quit_times -= 1
-                return 
-            }
-            exit(0)
-        }
         case: insert_char(v)
         }
     } 
@@ -362,93 +377,6 @@ editor_prompt :: proc(prompt: string, callback: proc([]byte, Key) = nil) -> stri
     }
 }
 
-/*** output ***/
-
-clear_screen :: proc(buf: ^Buffer) {
-    bytes.buffer_write_string(buf, "\x1b[2J")
-    bytes.buffer_write_string(buf, "\x1b[H")
-}
-
-draw_rows :: proc(buf: ^Buffer) {
-    lines_len := get_num_len(f64(E.num_rows))
-    text_width := E.screen_col - (lines_len + 3)
-    for r in 0..<E.screen_row {
-        filerow := r + E.rowoff
-        if filerow >= E.num_rows {
-            if E.num_rows == 0 && r == E.screen_row / 3 {
-                wel := fmt.tprintf("Olio editor -- version %s", Olio_Version)
-                if len(wel) > E.screen_col do wel = strings.cut(wel, 0, E.screen_col)
-                padding := (E.screen_col - len(wel)) / 2
-                if padding > 0 {
-                    bytes.buffer_write_string(buf, "~ |")
-                    padding -= 1
-                }
-                for _ in 0..<padding do bytes.buffer_write_string(buf, " ") 
-                bytes.buffer_write_string(buf, wel)
-            } else {
-                bytes.buffer_write_string(buf, "~")
-            }
-        } else {
-            bytes.buffer_write_string(buf, "\x1b[90m")  // draw line numbers
-            line_f := fmt.tprintf("% *d | ",lines_len, r + 1 + E.rowoff)
-            bytes.buffer_write_string(buf, line_f)
-            bytes.buffer_write_string(buf, "\x1b[m")
-            if E.coloff < E.row[filerow].rsize {
-                remain := E.row[filerow].rsize - E.coloff
-                len := min(remain, text_width)
-                c := E.row[filerow].render[E.coloff:]
-                hl := E.row[filerow].hl[E.coloff:]
-                current_color := -1
-                for j in 0..<len {
-                    if is_cntl(c[j]) {
-                        sym := c[j] <= 26 ? '@' + c[j] : '?'
-                        bytes.buffer_write_string(buf, "\x1b[7m")
-                        bytes.buffer_write_byte(buf, sym)
-                        bytes.buffer_write_string(buf, "\x1b[m")
-                        if current_color != -1 {
-                            color_f := fmt.tprintf("\x1b[%dm", current_color)
-                            bytes.buffer_write_string(buf, color_f)
-                        }
-                    } else if hl[j] == .Hl_Normal {
-                        if current_color != -1 {
-                            bytes.buffer_write_string(buf, "\x1b[39m")
-                            current_color = -1 
-                        }
-                        bytes.buffer_write_byte(buf, c[j])
-                    } else {
-                        color := syntax_to_color(hl[j])
-                        if color != current_color {
-                            current_color = color
-                            color_f := fmt.tprintf("\x1b[%dm", color)
-                            bytes.buffer_write_string(buf, color_f)
-                        }
-                        bytes.buffer_write_byte(buf, c[j])
-                    }
-                }
-            }
-            bytes.buffer_write_string(buf, "\x1b[39m")
-        }
-        bytes.buffer_write_string(buf, "\x1b[K")    // erase in line
-        bytes.buffer_write_string(buf, "\r\n") 
-    }
-}
-
-refresh_screen :: proc() {
-    editor_scroll()
-    buffer: Buffer
-    defer bytes.buffer_destroy(&buffer)
-    bytes.buffer_write_string(&buffer, "\x1b[?25l")
-    bytes.buffer_write_string(&buffer, "\x1b[H")
-    draw_rows(&buffer)
-    draw_status_bar(&buffer)
-    draw_status_message_bar(&buffer)
-    line_len := get_num_len(f64(E.num_rows))
-    pos := fmt.tprintf("\x1b[%d;%dH", E.cy - E.rowoff + 1, (E.rx + line_len + 3) - E.coloff + 1)
-    bytes.buffer_write_string(&buffer, pos)
-    bytes.buffer_write_string(&buffer, "\x1b[?25h")
-    os.write_string(os.stdout, bytes.buffer_to_string(&buffer))
-}
-
 editor_scroll :: proc() {
     E.rx = 0
     if E.cy < E.num_rows do E.rx = row_cx_to_rx(&E.row[E.cy], E.cx)
@@ -484,33 +412,10 @@ editor_update_row :: proc(row: ^E_Row) {
     update_syntax(row)
 }
 
-draw_status_bar :: proc(buf: ^Buffer) {
-    bytes.buffer_write_string(buf, "\x1b[7m")
-    status := fmt.tprintf("%.20s - %d lines %s", E.filename != "" ? E.filename : "[No Name]", E.num_rows, E.dirty != 0 ? "(modified)" : "")
-    rstatus := fmt.tprintf("%s | %d/%d", E.syntax != nil ? E.syntax.filetype : "no ft", E.cy + 1, E.num_rows)
-    if len(status) > E.screen_col do status = status[:E.screen_col]
-    bytes.buffer_write_string(buf, status)
-    for i in len(status)..<E.screen_col { 
-        if E.screen_col - i == len(rstatus) {
-            bytes.buffer_write_string(buf, rstatus)
-            break
-        } else do bytes.buffer_write_string(buf, " ")
-    }
-    bytes.buffer_write_string(buf, "\x1b[m")
-    bytes.buffer_write_string(buf, "\r\n")
-}
-
 set_status_message :: proc(format: string, args: ..any) {
     if len(E.status_msg) != 0 do delete(E.status_msg)
     E.status_msg = strings.clone(fmt.tprintf(format, ..args))
     E.status_msg_time = time.now()
-}
-
-draw_status_message_bar :: proc(buf: ^Buffer) {
-    bytes.buffer_write_string(buf, "\x1b[K")
-    len := len(E.status_msg)
-    if len > E.screen_col do len = E.screen_col
-    if len > 0 && time.since(E.status_msg_time) < 5 * time.Second do bytes.buffer_write_string(buf, E.status_msg)
 }
 
 /*** row operations ***/
@@ -860,17 +765,21 @@ init_editor :: proc() {
     E.dirty, E.syntax = 0, nil
     E.filename, E.status_msg, E.status_msg_time = "", "", time.now()
     if get_window_size(&E) == .Err do die("get window size error")
-    E.screen_row -= 2
+    ide_init()   // the IDE layer derives the text area from the window size
 }
 
 main :: proc() {
     defer disable_raw_mode()
-    enable_raw_mode()    
+    enable_raw_mode()
     init_editor()
     if len(os.args) >= 2 {
-        editor_open(os.args[1])
+        path := abs_path(os.args[1])
+        defer delete(path)
+        if buf_open(path) {
+            ide_set_root_from_file(path)
+        }
     }
-    set_status_message("HELP: Ctrl-S = save | Ctrl-Q = quit | Ctrl-F = find")
+    set_status_message("Ctrl-B files | Ctrl-R build | Ctrl-O open | Ctrl-N buffer | Ctrl-Q quit")
     for {
         refresh_screen()
         handle_keypress()
