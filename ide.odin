@@ -508,9 +508,10 @@ build_run :: proc() {
         set_build_status(fmt.tprintf("build ok  %d ms", elapsed))
         set_status_message("Build ok in %d ms", elapsed)
     } else {
+        err_word := errors == 1 ? "error" : "errors"
         IDE.build_ok = false
-        set_build_status(fmt.tprintf("%d errors  exit %d  %d ms", errors, state.exit_code, elapsed))
-        set_status_message("Build failed: %d errors", errors)
+        set_build_status(fmt.tprintf("%d %s  exit %d  %d ms", errors, err_word, state.exit_code, elapsed))
+        set_status_message("Build failed: %d %s", errors, err_word)
     }
 
     // Focus the first diagnostic that points at a file.
@@ -938,9 +939,6 @@ ide_handle_key :: proc(k: Key) -> bool {
             return true
         case cntl_key('w'):
             buf_close(IDE.active)
-            return true
-        case cntl_key('q'):
-            request_quit()
             return true
         case '\x1b':
             if IDE.focus != .Editor {

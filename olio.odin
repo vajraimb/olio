@@ -307,10 +307,16 @@ request_quit :: proc() {
 
 handle_keypress :: proc() {
     c := read_key()
-    if ide_handle_key(c) {
-        quit_times = Quit_Times
+
+    // Ctrl-Q is handled here (not in the IDE layer) because it is the only key
+    // that must *not* reset `quit_times`: repeated presses have to accumulate.
+    if v, ok := c.(byte); ok && v == cntl_key('q') {
+        request_quit()
         return
     }
+    quit_times = Quit_Times
+
+    if ide_handle_key(c) do return
     switch v in c {
     case Arrow:
         switch v {

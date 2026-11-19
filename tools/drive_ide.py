@@ -70,9 +70,9 @@ def tap(vk):
 def ctrl(ch):
     scan = u32.MapVirtualKeyW(VK_CONTROL, 0)
     u32.keybd_event(VK_CONTROL, scan, 0, 0)
-    time.sleep(0.05)
+    time.sleep(0.12)
     tap(ord(ch.upper()))
-    time.sleep(0.05)
+    time.sleep(0.12)
     u32.keybd_event(VK_CONTROL, scan, KEYUP, 0)
     time.sleep(0.15)
 
@@ -138,26 +138,38 @@ def main():
     LOG_PATH = os.path.join(outdir, "drive.log")
     open(LOG_PATH, "w").close()
 
-    before = set(console_windows())
-    p = subprocess.Popen([exe, target], cwd=workdir,
-                         creationflags=0x00000010, close_fds=True)
-    time.sleep(3.0)
-    new = [h for h in console_windows() if h not in before]
-    log("pid", p.pid, "alive", p.poll() is None, "windows", len(new))
-    if not new:
-        log("no console window")
-        p.terminate()
-        return
-    hwnd = new[0]
-
-    for _ in range(6):
-        u32.SetForegroundWindow(hwnd)
-        time.sleep(0.3)
-        if u32.GetForegroundWindow() == hwnd:
+    # Launch + steal focus, retrying: Windows only grants the foreground under
+    # rules we cannot always satisfy, and this is a throwaway demo window.
+    p = None
+    hwnd = None
+    for attempt in range(4):
+        before = set(console_windows())
+        argv = [exe] if target == "-" else [exe, target]
+        p = subprocess.Popen(argv, cwd=workdir,
+                             creationflags=0x00000010, close_fds=True)
+        time.sleep(3.0)
+        new = [h for h in console_windows() if h not in before]
+        log("attempt", attempt, "pid", p.pid, "alive", p.poll() is None,
+            "windows", len(new))
+        if not new:
+            p.terminate()
+            p = None
+            continue
+        hwnd = new[0]
+        for _ in range(4):
+            u32.SetForegroundWindow(hwnd)
+            time.sleep(0.3)
+            if u32.GetForegroundWindow() == hwnd:
+                break
+        if u32.GetForegroundWindow() == hwnd or focus_window(hwnd):
             break
-    if u32.GetForegroundWindow() != hwnd and not focus_window(hwnd):
-        log("ABORT: window not focused")
+        log("focus refused, retrying")
         p.terminate()
+        time.sleep(1.0)
+        p = None
+
+    if p is None or hwnd is None:
+        log("ABORT: could not get a focused window")
         return
     log("focused ok")
 
@@ -178,7 +190,7 @@ def main():
         tap(0x0D)  # enter jumps to the first diagnostic
         shot("jumped_to_error", 1.0)
         log("alive before quit:", p.poll() is None)
-        for _ in range(3):
+        for _ in range(4):
             ctrl("q")
             time.sleep(0.6)
         log("alive after quit:", p.poll() is None)
