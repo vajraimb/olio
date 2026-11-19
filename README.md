@@ -137,11 +137,16 @@ Measured on such a machine (agent trusts the developer folder
 | `%USERPROFILE%\.zcode\workspace\...` | `restricted SIDs = 0` | yes |
 | anywhere, launched elevated | full | yes |
 
-`launch-ide.cmd` therefore keeps a copy of `olio.exe` in the trusted folder
-(`OLIO_TRUSTED_DIR`, default `%USERPROFILE%\.zcode\workspace\olio`), re-copies it
-when the build changes, and runs that copy — no UAC prompt. If that folder does
-not exist it falls back to re-launching itself elevated (`OLIO_NO_ELEVATE=1`
-disables that).
+`launch-ide.cmd` therefore runs the copy of `olio.exe` that lives in the trusted
+folder (`OLIO_TRUSTED_DIR`, default `%USERPROFILE%\.zcode\workspace\olio`), which
+needs no elevation. `build.cmd` is the only step that installs it:
+
+```powershell
+.\build.cmd          # odin build . + copy olio.exe into the trusted folder
+```
+
+If that folder does not exist the launcher falls back to the local binary and
+asks for elevation (`OLIO_NO_ELEVATE=1` disables that).
 
 The clean long-term fix is to have IT allow-list `olio.exe`, or to sign it with
 the company code-signing certificate.
