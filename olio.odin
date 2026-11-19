@@ -165,9 +165,9 @@ editor_open :: proc (path: string) -> bool {
         return false
     }
 
-    content, err := os.read_entire_file_from_path(path, context.allocator)
-    if err != nil {
-        set_status_message("Cannot open %s", path)
+    content, rerr := read_file_raw(path)
+    if rerr != "" {
+        set_status_message("Cannot open %s: %s", path, rerr)
         return false
     }
     defer delete(content)
@@ -215,48 +215,31 @@ rows_to_string :: proc() -> ([]byte, int) {
     return buf[:], totlen
 } 
 
-// Explains the usual causes of a failure instead of just naming the errno.
-save_hint :: proc(err: os.Error) -> string {
-    switch err {
-    case .Permission_Denied:
-        return " (read-only, open in another program, or a protected folder)"
-    case .Not_Exist:
-        return " (the directory does not exist)"
-    case .Exist:
-        return " (the path is a directory)"
-    case .Invalid_File:
-        return " (invalid file name)"
-    case:
-        return ""
-    }
-}
-
 // Creates and removes a probe file, to tell "this folder refuses writes" apart
-// from "this particular name was refused".
+// from "this particular name was refused". Uses the same raw writer as the real
+// save so both agree.
 dir_writable :: proc(dir: string) -> bool {
     if dir == "" do return false
     probe := path_join(dir, ".olio-write-probe")
     defer delete(probe)
 
-    fd, err := os.open(probe, os.O_RDWR | os.O_CREATE | os.O_TRUNC, os.perm(0o644))
-    if err != nil do return false
-    os.close(fd)
+    payload: []byte = {'x'}
+    _, err := write_file_raw(probe, payload)
+    if err != "" do return false
     os.remove(probe)
     return true
 }
 
-save_reason :: proc(err: os.Error, path: string) -> string {
-    if err != .Permission_Denied do return save_hint(err)
-
+save_reason :: proc(path: string) -> string {
     dir := path_dir(path)
     if !dir_writable(dir) {
         return fmt.tprintf(
-            "the folder %s does not accept writes from olio - protected folder, OneDrive lock, no permission, a security agent blocking this unsigned exe, or olio running inside a sandbox/restricted token (if other programs can write there, restart olio from Explorer or a normal terminal)", dir)
+            "the folder %s refuses writes - protected folder, OneDrive lock, no permission, or an endpoint agent blocking this executable", dir)
     }
     if fi, serr := os.stat(path, context.allocator); serr == nil && fi.type != .Directory {
         return "the file exists but cannot be written - read-only, or open in another program"
     }
-    return "the folder accepts writes but this name was refused - try another name"
+    return "this name was refused in a writable folder - try another name"
 }
 
 editor_save :: proc() {
@@ -273,7 +256,7 @@ editor_save :: proc() {
     path := path_norm(abs_path(E.filename))
     defer delete(path)
 
-    // Pre-flight: report what is actually wrong before blaming the open() error.
+    // Pre-flight: report what is actually wrong before attempting the write.
     if fi, serr := os.stat(path, context.allocator); serr == nil {
         if fi.type == .Directory {
             set_status_message("Can't save: %s is a directory", path)
@@ -291,31 +274,14 @@ editor_save :: proc() {
     data, _ := rows_to_string()
     defer delete(data)
 
-    fd, err := os.open(path, os.O_RDWR | os.O_CREATE | os.O_TRUNC, os.perm(0o644))
-    if err != nil {
-        set_status_message("Can't save %s: %v - %s", path, err, save_reason(err, path))
+    written, werr := write_file_raw(path, data)
+    if werr != "" {
+        set_status_message("Can't save %s: %s - %s", path, werr, save_reason(path))
         if was_unnamed {
             // Let Ctrl-S ask for a name again instead of retrying the bad one.
             delete(E.filename)
             E.filename = ""
         }
-        return
-    }
-
-    // A single write() can be short; keep going until everything is on disk.
-    written := 0
-    for written < len(data) {
-        n, werr := os.write(fd, data[written:])
-        if werr != nil {
-            os.close(fd)
-            set_status_message("Can't save %s: write failed after %d/%d bytes: %v", path, written, len(data), werr)
-            return
-        }
-        if n <= 0 do break
-        written += n
-    }
-    if cerr := os.close(fd); cerr != nil {
-        set_status_message("Can't save %s: flush failed: %v%s", path, cerr, save_hint(cerr))
         return
     }
 

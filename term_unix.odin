@@ -12,6 +12,28 @@ import "core:sys/posix"
 
 Term_Mode :: posix.termios
 
+// On POSIX there is no `FILE_FLAG_BACKUP_SEMANTICS` equivalent to avoid, so the
+// regular os package is fine here (same signature as the Windows version).
+write_file_raw :: proc(path: string, data: []byte) -> (written: int, err: string) {
+	fd, oerr := os.open(path, os.O_WRONLY | os.O_CREATE | os.O_TRUNC, os.perm(0o644))
+	if oerr != nil do return 0, fmt.tprintf("%v", oerr)
+	defer os.close(fd)
+
+	for written < len(data) {
+		n, werr := os.write(fd, data[written:])
+		if werr != nil do return written, fmt.tprintf("%v", werr)
+		if n <= 0 do break
+		written += n
+	}
+	return written, ""
+}
+
+read_file_raw :: proc(path: string) -> (data: []byte, err: string) {
+	content, rerr := os.read_entire_file_from_path(path, context.allocator)
+	if rerr != nil do return nil, fmt.tprintf("%v", rerr)
+	return content, ""
+}
+
 enable_raw_mode :: proc() {
 	if posix.tcgetattr(posix.STDIN_FILENO, &E.origin_mode) != posix.result.OK do die("tcgetattr error")
 	raw := E.origin_mode
