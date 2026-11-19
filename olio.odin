@@ -1,7 +1,5 @@
 package olio
 
-import "core:sys/posix"
-import "core:c/libc"
 import "core:os"
 import "core:fmt"
 import "core:slice"
@@ -30,7 +28,7 @@ Config :: struct {      // editor's config
     num_rows: int,
     dirty: int,         // be modified
     row: [dynamic]E_Row,
-    origin_termios: posix.termios,
+    origin_mode: Term_Mode,
     filename: string,
     status_msg: string,
     status_msg_time: time.Time,
@@ -153,15 +151,15 @@ append_row :: proc(line: []byte) {
 editor_open :: proc (path: string) {
     E.filename = path
     select_syntax_highlight()
-    content, ok := os.read_entire_file(path)
+    content, err := os.read_entire_file_from_path(path, context.allocator)
     defer delete(content)
-    if !ok do die("Failed to read file")
+    if err != nil do die("Failed to read file")
 
     start := 0 
     for i := 0; i < len(content); i += 1 {
         if content[i] == '\n' {
             line := content[start:i]
-            if len(line) > 0 && content[len(line)-1] == '\r' do line = content[:len(line)-1]
+            if len(line) > 0 && line[len(line)-1] == '\r' do line = line[:len(line)-1]
             insert_row(E.num_rows, line)
             start = i + 1
         }
@@ -195,7 +193,7 @@ editor_save :: proc() {
     }
     buf, len := rows_to_string()
     defer delete(buf)
-    fd, err := os.open(E.filename, os.O_RDWR | os.O_CREATE | os.O_TRUNC, 0o644)
+    fd, err := os.open(E.filename, os.O_RDWR | os.O_CREATE | os.O_TRUNC, os.perm(0o644))
     if err != nil {
         os.close(fd)
         set_status_message("Can't save! I/O error: %s", err)
@@ -623,6 +621,9 @@ del_char :: proc() {
 
 /*** terminal ***/
 
+// Platform-specific: enable_raw_mode, disable_raw_mode, get_window_size and
+// the Term_Mode type live in term_unix.odin / term_windows.odin.
+
 die :: proc(msg: string) {
     disable_raw_mode()
     fmt.println(msg)
@@ -632,61 +633,6 @@ die :: proc(msg: string) {
 exit :: proc(code: int) {
     disable_raw_mode()
     os.exit(code)
-}
-
-enable_raw_mode :: proc() {
-    if posix.tcgetattr(posix.STDIN_FILENO, &E.origin_termios) != posix.result.OK do die("tcgetattr error")
-    raw := E.origin_termios
-    raw.c_iflag -= {
-        posix.CInput_Flag_Bits.BRKINT,
-        posix.CInput_Flag_Bits.ICRNL,
-        posix.CInput_Flag_Bits.INPCK,
-        posix.CInput_Flag_Bits.ISTRIP,
-        posix.CInput_Flag_Bits.IXON,
-    }
-    raw.c_oflag -= {
-        posix.COutput_Flag_Bits.OPOST,
-    }
-    raw.c_cflag -= {
-        posix.CControl_Flag_Bits.CS8,
-    }
-    raw.c_lflag -= {
-        posix.CLocal_Flag_Bits.ECHO,
-        posix.CLocal_Flag_Bits.ICANON,
-        posix.CLocal_Flag_Bits.IEXTEN,
-        posix.CLocal_Flag_Bits.ISIG,
-    }
-    raw.c_cc[posix.Control_Char.VMIN] = 0
-    raw.c_cc[posix.Control_Char.VTIME] = 1
-    if posix.tcsetattr(posix.STDIN_FILENO, posix.TC_Optional_Action.TCSAFLUSH, &raw) != posix.result.OK do die("tcsetattr error")
-}
-
-disable_raw_mode :: proc() {
-    if posix.tcsetattr(posix.STDIN_FILENO, posix.TC_Optional_Action.TCSAFLUSH, &E.origin_termios) != posix.result.OK do die("tcsetattr error")
-}
-
-get_cursor_pos :: proc(conf: ^Config) -> Result {
-    buf: [dynamic]byte
-    if _, err := os.write_string(os.stdout, "\x1b[6n"); err != nil do return .Err // report active position
-    fmt.printf("\r\n")
-    for i in 0..<size_of(buf) - 1 {
-        b: [1]byte
-        if _, err := os.read(os.stdin, b[:]); err != nil do break
-        if b[0] == 'R' do break
-        append(&buf, b[0])
-    }
-    if buf[0] != '\x1b' || buf[1] != '[' do return .Err // parse the response which is a escape sequence
-    res := buf[2:]
-    if ss := strings.split(string(res), ";"); len(ss) == 2 {
-        if res, ok := strconv.parse_int(ss[0]); ok do conf.screen_row = res
-        if res, ok := strconv.parse_int(ss[1]); ok do conf.screen_col = res
-    } 
-    return .Ok
-}
-
-get_window_size :: proc(conf: ^Config) -> Result {
-    if _, err := os.write_string(os.stdout, "\x1b[999C\x1b[999B"); err != nil do return .Err
-    return get_cursor_pos(conf)
 }
 
 /*** find ***/

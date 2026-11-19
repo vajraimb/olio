@@ -1,3 +1,8 @@
 olio
 *.txt
 *.c
+
+olio.exe
+screenshots/
+tools/scratch/
+__pycache__/
