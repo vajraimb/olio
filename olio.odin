@@ -251,7 +251,7 @@ save_reason :: proc(err: os.Error, path: string) -> string {
     dir := path_dir(path)
     if !dir_writable(dir) {
         return fmt.tprintf(
-            "the folder %s does not accept writes from olio - protected folder, OneDrive lock, no permission, or a security agent blocking this unsigned exe", dir)
+            "the folder %s does not accept writes from olio - protected folder, OneDrive lock, no permission, a security agent blocking this unsigned exe, or olio running inside a sandbox/restricted token (if other programs can write there, restart olio from Explorer or a normal terminal)", dir)
     }
     if fi, serr := os.stat(path, context.allocator); serr == nil && fi.type != .Directory {
         return "the file exists but cannot be written - read-only, or open in another program"
