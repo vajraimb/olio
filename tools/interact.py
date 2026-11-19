@@ -72,7 +72,18 @@ def shot(hwnd, path):
 KEYUP = 0x0002
 
 
+FOCUS_HWND = None
+
+
+def _ensure_focus():
+    """Never type into whatever else happens to be in front."""
+    if FOCUS_HWND is None:
+        return
+    if u32.GetForegroundWindow() != FOCUS_HWND:
+        raise RuntimeError("lost foreground to another window; aborting key injection")
+
 def tap(vk):
+    _ensure_focus()
     scan = u32.MapVirtualKeyW(vk, 0)
     u32.keybd_event(vk, scan, 0, 0)
     u32.keybd_event(vk, scan, KEYUP, 0)
@@ -81,6 +92,7 @@ def tap(vk):
 
 def type_text(text):
     for ch in text:
+        _ensure_focus()
         if ch == "\r":
             tap(0x0D)
             continue
@@ -109,6 +121,7 @@ def type_text(text):
 
 
 def ctrl(ch):
+    _ensure_focus()
     scan = u32.MapVirtualKeyW(0x11, 0)
     u32.keybd_event(0x11, scan, 0, 0)
     time.sleep(0.05)
@@ -152,6 +165,8 @@ def main():
         log("ABORT: could not bring olio window to foreground; not injecting keys")
         p.terminate()
         return
+    global FOCUS_HWND
+    FOCUS_HWND = hwnd
     log("window focused, injecting keys")
 
     type_text("hello from olio\r")

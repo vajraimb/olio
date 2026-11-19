@@ -215,30 +215,80 @@ rows_to_string :: proc() -> ([]byte, int) {
     return buf[:], totlen
 } 
 
+// Explains the usual causes of a failure instead of just naming the errno.
+save_hint :: proc(err: os.Error) -> string {
+    switch err {
+    case .Permission_Denied:
+        return " (read-only, open in another program, or a protected folder)"
+    case .Not_Exist:
+        return " (the directory does not exist)"
+    case .Exist:
+        return " (the path is a directory)"
+    case .Invalid_File:
+        return " (invalid file name)"
+    case:
+        return ""
+    }
+}
+
 editor_save :: proc() {
     if E.filename == "" {
-        E.filename = editor_prompt("Save as: %s (ESC to cancel)", nil)
-        if E.filename == "" {
+        name := editor_prompt("Save as: %s (ESC to cancel)", nil)
+        if name == "" {
             set_status_message("Save aborted")
-            return 
+            return
+        }
+        if len(E.filename) > 0 do delete(E.filename)
+        E.filename = name
+    }
+
+    path := path_norm(abs_path(E.filename))
+    defer delete(path)
+
+    // Pre-flight: report what is actually wrong before blaming the open() error.
+    if fi, serr := os.stat(path, context.allocator); serr == nil {
+        if fi.type == .Directory {
+            set_status_message("Can't save: %s is a directory", path)
+            return
+        }
+    } else {
+        if dir := path_dir(path); dir != "" {
+            if dfi, derr := os.stat(dir, context.allocator); derr != nil || dfi.type != .Directory {
+                set_status_message("Can't save: no such directory %s", dir)
+                return
+            }
         }
     }
-    buf, len := rows_to_string()
-    defer delete(buf)
-    fd, err := os.open(E.filename, os.O_RDWR | os.O_CREATE | os.O_TRUNC, os.perm(0o644))
+
+    data, _ := rows_to_string()
+    defer delete(data)
+
+    fd, err := os.open(path, os.O_RDWR | os.O_CREATE | os.O_TRUNC, os.perm(0o644))
     if err != nil {
-        os.close(fd)
-        set_status_message("Can't save! I/O error: %s", err)
-        return 
+        set_status_message("Can't save %s: %v%s", path_base(path), err, save_hint(err))
+        return
     }
-    defer os.close(fd)
-    _, err = os.write(fd, buf)
-    if err != nil do set_status_message("Can't save! I/O error: %s", err)
-    else { 
-        set_status_message("%d bytes written to disk", len)
-        E.dirty = 0
-        select_syntax_highlight()
+
+    // A single write() can be short; keep going until everything is on disk.
+    written := 0
+    for written < len(data) {
+        n, werr := os.write(fd, data[written:])
+        if werr != nil {
+            os.close(fd)
+            set_status_message("Can't save %s: write failed after %d/%d bytes: %v", path_base(path), written, len(data), werr)
+            return
+        }
+        if n <= 0 do break
+        written += n
     }
+    if cerr := os.close(fd); cerr != nil {
+        set_status_message("Can't save %s: flush failed: %v%s", path_base(path), cerr, save_hint(cerr))
+        return
+    }
+
+    set_status_message("%d bytes written to %s", written, path)
+    E.dirty = 0
+    select_syntax_highlight()
 }
 
 read_key :: proc() -> Key {

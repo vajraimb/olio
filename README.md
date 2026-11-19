@@ -144,8 +144,34 @@ $sc.Save()
 
 See [PORTING.md](./PORTING.md) for the platform notes.
 
-## Limitations
+## When a save fails
 
+`Ctrl-S` reports the full path plus the reason, for example:
+
+```
+Can't save notes.txt: Permission_Denied (read-only, open in another program, or a protected folder)
+Can't save: no such directory C:\Users\me\notes\drafts
+Can't save: C:\Users\me\notes is a directory
+```
+
+`Permission_Denied` on Windows is `ERROR_ACCESS_DENIED` **or**
+`ERROR_SHARING_VIOLATION`, so it means one of:
+
+- the file exists and is read-only (`attrib -r` clears that);
+- another program holds it open without sharing;
+- the folder is protected (Windows Controlled Folder Access, Program Files,
+  `C:\Windows\...`, a network share without write rights, a OneDrive folder that
+  is still syncing or cloud-only);
+- the name contains characters Windows rejects (`"`, `:`, `|`, ...).
+
+`tools/savetest` is a small package that prints the error for each of these
+cases, useful to tell a real permission problem from a sandbox/policy one:
+
+```powershell
+odin run tools/savetest
+```
+
+## Limitations
 - Terminal resize is detected on Windows only; the POSIX path keeps the size
   measured at startup.
 - The build is synchronous: the UI waits for `odin build` to finish (it renders a

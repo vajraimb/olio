@@ -1,4 +1,4 @@
-﻿"""Launch a command in its own console and capture that window with PrintWindow.
+"""Launch a command in its own console and capture that window with PrintWindow.
 
 Unlike grabbing the screen this does not need the window to be in front, so it
 neither steals focus nor photographs whatever else is on the desktop.
