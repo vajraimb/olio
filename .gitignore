@@ -7,3 +7,4 @@ tools/verify.log
 tools/scratch/demo.odin
 screenshots/**/drive.log
 screenshots/**/drive_crash.log
+shot_*.png
