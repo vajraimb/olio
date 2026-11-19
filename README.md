@@ -137,17 +137,17 @@ Measured on such a machine (agent trusts the developer folder
 | `%USERPROFILE%\.zcode\workspace\...` | `restricted SIDs = 0` | yes |
 | anywhere, launched elevated | full | yes |
 
-`launch-ide.cmd` therefore runs the copy of `olio.exe` that lives in the trusted
-folder (`OLIO_TRUSTED_DIR`, default `%USERPROFILE%\.zcode\workspace\olio`), which
-needs no elevation. `build.cmd` is the only step that installs it:
+``launch-ide.cmd` just runs `olio.exe` from its own directory, so on this machine
+the project itself lives in the trusted folder
+(`%USERPROFILE%\.zcode\workspace\olio`): exactly one copy of the binary and no
+install step.
 
 ```powershell
-.\build.cmd          # odin build . + copy olio.exe into the trusted folder
+.\build.cmd          # odin build . -out:olio.exe  (in place)
 ```
 
-If that folder does not exist the launcher falls back to the local binary and
-asks for elevation (`OLIO_NO_ELEVATE=1` disables that).
-
+The Desktop shortcut and the `olio` command on `PATH` both point at that folder,
+so saving needs no elevation.
 The clean long-term fix is to have IT allow-list `olio.exe`, or to sign it with
 the company code-signing certificate.
 
