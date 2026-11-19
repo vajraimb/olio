@@ -61,6 +61,30 @@ Set `OLIO_ODIN` to point at a specific compiler if `odin` is not on `PATH`:
 $env:OLIO_ODIN = "C:\Users\me\Odin\odin.exe"
 ```
 
+### Desktop launcher (Windows)
+
+`launch-ide.cmd` starts the IDE in a console window with the Odin directory
+prepended to `PATH` if the compiler is not there yet:
+
+- double-click it (or a shortcut to it) to open the olio project;
+- drag a **file** onto it to open that file;
+- drag a **folder** onto it to use that folder as the project root.
+
+`Olio IDE.lnk` on the Desktop points at this script and uses `assets/olio.ico`
+as its icon. Recreate the shortcut with:
+
+```powershell
+$lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Olio IDE.lnk'
+$ws  = New-Object -ComObject WScript.Shell
+$sc  = $ws.CreateShortcut($lnk)
+$sc.TargetPath       = (Resolve-Path .\launch-ide.cmd).Path
+$sc.WorkingDirectory = (Get-Location).Path
+$sc.IconLocation     = (Resolve-Path .\assets\olio.ico).Path + ',0'
+$sc.Save()
+```
+
+![launched from the desktop shortcut](./screenshots/launcher.png)
+
 ## Layout of the code
 
 | File | Contents |
