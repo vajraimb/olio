@@ -120,19 +120,31 @@ prepended to `PATH` if the compiler is not there yet:
 
 ### Managed machines (application control)
 
-On a machine with an endpoint agent such as BeyondTrust Defendpoint or Zscaler,
-an unsigned program may be allowed to *run* but denied *write* access to the user
-profile. The symptom is a save failing with `Permission_Denied` /
-`CreateFileW failed (5)` even though PowerShell or Notepad can write to the same
-folder.
+On a machine with an endpoint agent such as BeyondTrust / Avecto Privilege Guard
+or Zscaler, an executable the agent does not recognise is launched with a
+**restricted token**: it runs, but every write to the user profile fails with
+`Permission_Denied` / `CreateFileW failed (5)` — even in `%TEMP%`, and even
+though PowerShell or Notepad can write the same folder. A GUI build does not
+change this: the decision is made per executable at process creation, not by
+console vs window subsystem.
 
-`launch-ide.cmd` therefore re-launches itself elevated when it is not already
-running as administrator (one UAC prompt). You can also right-click `olio.exe` →
-**Run as administrator**, or start `olio` from an elevated terminal. Set
-`OLIO_NO_ELEVATE=1` to skip that behaviour.
+Measured on such a machine (agent trusts the developer folder
+`%USERPROFILE%\.zcode\workspace`):
 
-The proper fix is to have IT allow-list `olio.exe`, or to sign it with the
-company code-signing certificate.
+| Where `olio.exe` / a test binary lives | token | can write |
+| --- | --- | --- |
+| ordinary folder (repo, `%TEMP%`, Downloads) | `restricted SIDs = 4` | no |
+| `%USERPROFILE%\.zcode\workspace\...` | `restricted SIDs = 0` | yes |
+| anywhere, launched elevated | full | yes |
+
+`launch-ide.cmd` therefore keeps a copy of `olio.exe` in the trusted folder
+(`OLIO_TRUSTED_DIR`, default `%USERPROFILE%\.zcode\workspace\olio`), re-copies it
+when the build changes, and runs that copy — no UAC prompt. If that folder does
+not exist it falls back to re-launching itself elevated (`OLIO_NO_ELEVATE=1`
+disables that).
+
+The clean long-term fix is to have IT allow-list `olio.exe`, or to sign it with
+the company code-signing certificate.
 
 `Olio IDE.lnk` on the Desktop points at this script and uses `assets/olio.ico`
 as its icon. Recreate the shortcut with:
