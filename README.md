@@ -118,9 +118,24 @@ prepended to `PATH` if the compiler is not there yet:
 - drag a **file** onto it to open that file;
 - drag a **folder** onto it to use that folder as the project root.
 
+### Managed machines (application control)
+
+On a machine with an endpoint agent such as BeyondTrust Defendpoint or Zscaler,
+an unsigned program may be allowed to *run* but denied *write* access to the user
+profile. The symptom is a save failing with `Permission_Denied` /
+`CreateFileW failed (5)` even though PowerShell or Notepad can write to the same
+folder.
+
+`launch-ide.cmd` therefore re-launches itself elevated when it is not already
+running as administrator (one UAC prompt). You can also right-click `olio.exe` →
+**Run as administrator**, or start `olio` from an elevated terminal. Set
+`OLIO_NO_ELEVATE=1` to skip that behaviour.
+
+The proper fix is to have IT allow-list `olio.exe`, or to sign it with the
+company code-signing certificate.
+
 `Olio IDE.lnk` on the Desktop points at this script and uses `assets/olio.ico`
 as its icon. Recreate the shortcut with:
-
 ```powershell
 $lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Olio IDE.lnk'
 $ws  = New-Object -ComObject WScript.Shell

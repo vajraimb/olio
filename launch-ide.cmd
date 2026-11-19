@@ -4,12 +4,38 @@ rem Olio IDE launcher.
 rem
 rem Double-click to open the editor on the olio project, or drag a file/folder
 rem onto this script to open that instead.
+rem
+rem It re-launches itself elevated when it is not already running with
+rem administrator rights: managed machines (BeyondTrust Defendpoint, Zscaler,
+rem ...) commonly deny writes from unsigned programs unless they are elevated,
+rem and then the editor cannot save anything.
+rem
+rem Set OLIO_NO_ELEVATE=1 to skip the elevation (useful for testing).
 rem ---------------------------------------------------------------------------
 setlocal EnableExtensions
 title Olio IDE
 
 set "OLIO_HOME=%~dp0"
 if "%OLIO_HOME:~-1%"=="\" set "OLIO_HOME=%OLIO_HOME:~0,-1%"
+
+if not defined OLIO_NO_ELEVATE (
+    whoami /groups | findstr /c:"S-1-16-12288" /c:"S-1-16-16384" >nul 2>nul
+    if errorlevel 1 (
+        echo Olio needs administrator rights on this machine:
+        echo unsigned programs are not allowed to write files without them.
+        echo.
+        echo Click "Yes" on the Windows prompt to continue.
+        set "ELEVARGS="
+        if not "%~1"=="" set ELEVARGS=-ArgumentList '"%~1"'
+        powershell -NoProfile -Command "Start-Process -FilePath '%~f0' %ELEVARGS% -Verb RunAs"
+        if errorlevel 1 (
+            echo.
+            echo Elevation was cancelled - olio would not be able to save files.
+            pause
+        )
+        exit /b
+    )
+)
 
 rem The integrated build needs the Odin compiler on PATH.
 where odin >nul 2>nul

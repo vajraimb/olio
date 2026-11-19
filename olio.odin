@@ -234,7 +234,7 @@ save_reason :: proc(path: string) -> string {
     dir := path_dir(path)
     if !dir_writable(dir) {
         return fmt.tprintf(
-            "the folder %s refuses writes - protected folder, OneDrive lock, no permission, or an endpoint agent blocking this executable", dir)
+            "the folder %s refuses writes - protected folder, no permission, or application control blocking unsigned programs (on such machines start olio with \"Run as administrator\")", dir)
     }
     if fi, serr := os.stat(path, context.allocator); serr == nil && fi.type != .Directory {
         return "the file exists but cannot be written - read-only, or open in another program"
