@@ -209,6 +209,12 @@ buf_open :: proc(path_in: string) -> bool {
         }
     }
 
+    // Check before touching the current buffer, so a failed open costs nothing.
+    if fi, err := os.stat(path, context.allocator); err != nil || fi.type == .Directory {
+        delete(path)
+        return false
+    }
+
     buf_stash()
 
     reuse := len(IDE.bufs) == 1 && IDE.bufs[0].filename == "" && IDE.bufs[0].num_rows == 0
@@ -229,6 +235,33 @@ buf_open :: proc(path_in: string) -> bool {
     }
     delete(path)
     buf_stash()
+    return true
+}
+
+// Opens a path that does not exist yet as an empty buffer that carries the
+// filename, so `Ctrl-S` creates the file (the usual editor behaviour).
+buf_open_new :: proc(path_in: string) -> bool {
+    path := path_norm(abs_path(path_in))
+    defer delete(path)
+
+    for b, i in IDE.bufs {
+        if b.filename != "" && paths_equal(b.filename, path) {
+            buf_switch(i)
+            return true
+        }
+    }
+
+    buf_stash()
+    reuse := len(IDE.bufs) == 1 && IDE.bufs[0].filename == "" && IDE.bufs[0].num_rows == 0
+    if !reuse {
+        append(&IDE.bufs, Ide_Buf{})
+        IDE.active = len(IDE.bufs) - 1
+    }
+    clear_editor()
+    E.filename = strings.clone(path)
+    select_syntax_highlight()
+    buf_stash()
+    set_status_message("New file: %s", path_base(path))
     return true
 }
 
@@ -1072,9 +1105,31 @@ ide_open_prompt :: proc() {
     name := editor_prompt("Open: %s (ESC to cancel)", nil)
     defer delete(name)
     if name == "" do return
-    if buf_open(name) {
+
+    p := name
+    owned := false
+    if !is_abs_path(p) {
+        p = path_join(IDE.root, name)
+        owned = true
+    }
+    defer if owned { delete(p) }
+
+    ok := false
+    if fi, err := os.stat(p, context.allocator); err == nil {
+        if fi.type == .Directory {
+            ide_set_root(p)
+            IDE.focus = .Editor
+            return
+        }
+        ok = buf_open(p)
+    } else {
+        // Does not exist yet: open it as a new file.
+        ok = buf_open_new(p)
+    }
+
+    if ok {
         IDE.focus = .Editor
-        set_status_message("Opened %s", path_base(name))
+        set_status_message("Opened %s", path_base(p))
     }
 }
 
@@ -1089,6 +1144,45 @@ ide_goto_prompt :: proc() {
 
 /* ------------------------------------------------------------------- init */
 
+ODIN_BINARY :: "odin.exe" when ODIN_OS == .Windows else "odin"
+
+// Looks for the compiler on PATH, then in the default install location, so the
+// tool keys also work in a shell whose PATH never mentions Odin.
+which_odin :: proc() -> string {
+    if v, ok := os.lookup_env("OLIO_ODIN", context.allocator); ok && v != "" {
+        return v
+    }
+
+    if path_env, ok := os.lookup_env("PATH", context.allocator); ok {
+        start := 0
+        for i := 0; i <= len(path_env); i += 1 {
+            if i == len(path_env) || path_env[i] == ';' || path_env[i] == ':' {
+                dir := path_env[start:i]
+                if dir != "" {
+                    cand := path_join(dir, ODIN_BINARY)
+                    if fi, err := os.stat(cand, context.allocator); err == nil && fi.type == .Regular {
+                        return cand
+                    }
+                    delete(cand)
+                }
+                start = i + 1
+            }
+        }
+        delete(path_env)
+    }
+
+    if home, ok := os.lookup_env("USERPROFILE", context.allocator); ok {
+        cand := path_join(home, "Odin/odin.exe")
+        if fi, err := os.stat(cand, context.allocator); err == nil && fi.type == .Regular {
+            return cand
+        }
+        delete(cand)
+        delete(home)
+    }
+
+    return strings.clone("odin")
+}
+
 ide_init :: proc() {
     IDE.win_row = E.screen_row
     IDE.win_col = E.screen_col
@@ -1097,8 +1191,7 @@ ide_init :: proc() {
     IDE.build_height = 9
     IDE.expanded = make(map[string]bool)
 
-    IDE.odin = "odin"
-    if v, ok := os.lookup_env("OLIO_ODIN", context.allocator); ok do IDE.odin = v
+    IDE.odin = which_odin()
     if v, err := os.get_working_directory(context.allocator); err == nil {
         IDE.root = v
     }
@@ -1108,13 +1201,19 @@ ide_init :: proc() {
     buf_stash()
 }
 
+ide_set_root :: proc(dir: string) {
+    if dir == "" do return
+    delete(IDE.root)
+    IDE.root = strings.clone(dir)
+    if IDE.sidebar_visible do sidebar_rescan()
+    set_status_message("Project: %s", path_base(dir))
+}
+
 ide_set_root_from_file :: proc(path: string) {
     dir := path_dir(path)
     if dir == "" do return
     if IDE.root != "" && IDE.root == dir do return
     if IDE.root == "" || len(IDE.bufs) <= 1 {
-        delete(IDE.root)
-        IDE.root = strings.clone(dir)
-        if IDE.sidebar_visible do sidebar_rescan()
+        ide_set_root(dir)
     }
 }

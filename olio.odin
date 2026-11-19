@@ -148,13 +148,34 @@ append_row :: proc(line: []byte) {
 
 /*** file IO ***/
 
+// An editor that reads everything into memory should say no at some point.
+Max_File_Bytes :: 64 * 1024 * 1024
+
+is_binary :: proc(content: []byte) -> bool {
+    n := min(len(content), 8192)
+    for i in 0 ..< n {
+        if content[i] == 0 do return true
+    }
+    return false
+}
+
 editor_open :: proc (path: string) -> bool {
+    if fi, serr := os.stat(path, context.allocator); serr == nil && fi.size > Max_File_Bytes {
+        set_status_message("%s is too large for olio (%v MB)", path_base(path), fi.size / (1024 * 1024))
+        return false
+    }
+
     content, err := os.read_entire_file_from_path(path, context.allocator)
     if err != nil {
         set_status_message("Cannot open %s", path)
         return false
     }
     defer delete(content)
+
+    if is_binary(content) {
+        set_status_message("%s looks like a binary file", path_base(path))
+        return false
+    }
 
     E.filename = strings.clone(path)
     select_syntax_highlight()
@@ -778,14 +799,30 @@ main :: proc() {
     defer disable_raw_mode()
     enable_raw_mode()
     init_editor()
+
+    // Show the default hint first, so anything the command line reports
+    // ("New file", "looks like a binary file", ...) is what the user ends up seeing.
+    set_status_message("Ctrl-B files | Ctrl-R build | Ctrl-O open | Ctrl-N buffer | Ctrl-Q quit")
+
+    // `olio`            -> current directory as the project
+    // `olio path/dir`   -> that directory as the project
+    // `olio some.txt`   -> open it; if it does not exist, edit it as a new file
     if len(os.args) >= 2 {
-        path := abs_path(os.args[1])
-        defer delete(path)
-        if buf_open(path) {
-            ide_set_root_from_file(path)
+        arg := abs_path(os.args[1])
+        defer delete(arg)
+
+        if fi, err := os.stat(arg, context.allocator); err == nil {
+            if fi.type == .Directory {
+                ide_set_root(arg)
+            } else if buf_open(arg) {
+                ide_set_root_from_file(arg)
+            }
+        } else {
+            buf_open_new(arg)
+            ide_set_root_from_file(arg)
         }
     }
-    set_status_message("Ctrl-B files | Ctrl-R build | Ctrl-O open | Ctrl-N buffer | Ctrl-Q quit")
+
     for {
         refresh_screen()
         handle_keypress()

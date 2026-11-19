@@ -72,11 +72,42 @@ odin build . -out:olio.exe
 
 On Linux/macOS the same commands work with `olio` as the output name.
 
-Set `OLIO_ODIN` to point at a specific compiler if `odin` is not on `PATH`:
+Set `OLIO_ODIN` to point at a specific compiler if `odin` is not on `PATH`
+(otherwise olio looks for `odin.exe` on `PATH`, then in `%USERPROFILE%\Odin`):
 
 ```powershell
 $env:OLIO_ODIN = "C:\Users\me\Odin\odin.exe"
 ```
+
+### Starting from any directory
+
+Put the folder holding `olio.exe` on the **user** `PATH` once:
+
+```powershell
+$dir = (Resolve-Path .).Path
+[Environment]::SetEnvironmentVariable(
+    'Path', [Environment]::GetEnvironmentVariable('Path','User') + ';' + $dir, 'User')
+```
+
+Open a new terminal, then:
+
+```powershell
+olio                      # cwd becomes the project root
+olio .                    # same thing
+olio C:\notes\todo.txt    # open any text file, from anywhere
+olio ..\other\proj        # open another project
+olio brand-new.txt        # does not exist yet: new buffer, Ctrl-S creates it
+```
+
+What the argument does:
+
+| Argument | Result |
+| --- | --- |
+| none | project root = current directory, empty buffer |
+| a directory | that directory becomes the project root |
+| an existing text file | opened, and the root becomes its directory |
+| a path that does not exist | new empty buffer carrying that name (`Ctrl-S` writes it) |
+| a binary or >64 MB file | refused with a status message, nothing else changes |
 
 ### Desktop launcher (Windows)
 
