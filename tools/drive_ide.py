@@ -184,6 +184,20 @@ def main():
 
     shot("editor")
 
+    if mode == "tools":
+        ctrl("k")               # odin check on the current buffer's package
+        shot("check", 6.0)
+        ctrl("t")               # odin run, output captured into the panel
+        shot("run", 8.0)
+        log("alive before quit:", p.poll() is None)
+        for _ in range(4):
+            ctrl("q")
+            time.sleep(0.6)
+        log("alive after quit:", p.poll() is None)
+        if p.poll() is None:
+            p.terminate()
+        return
+
     if mode == "error":
         ctrl("r")
         shot("build_error", 9.0)

@@ -14,11 +14,14 @@ Written in Odin. Runs on Windows (Win32 console) and on POSIX terminals
 - Odin syntax highlighting, line numbers, control-character display, hard tabs
 - Multiple buffers in a tab bar, per-buffer cursor/scroll/dirty state
 - Project file tree with expand/collapse (`Ctrl-B`)
-- Integrated build (`Ctrl-R`): runs `odin build` on the project root, lists
-  diagnostics by kind, `Enter` on a diagnostic opens the file at `file(line:col)`
+- Odin toolchain integration, run on the package of the current buffer:
+  - `Ctrl-K` `odin check` — diagnostics only, no codegen (fastest feedback)
+  - `Ctrl-R` `odin build` — binary goes to a temp dir, so it never locks `olio.exe`
+  - `Ctrl-T` `odin run` — builds and executes, the program's output lands in the panel
+  - diagnostics are listed by kind and `Enter` opens the file at `file(line:col)`
 - Find (`Ctrl-F`), save (`Ctrl-S`), go to line (`Ctrl-G`), open by path (`Ctrl-O`)
 - CRLF and UTF-8 BOM tolerant file loading
-- Undo-free, dependency-free, under 1.6k lines of Odin
+- Undo-free, dependency-free, under 2.1k lines of Odin
 
 ![build error and jump](./screenshots/error/03_jumped_to_error.png)
 
@@ -27,7 +30,9 @@ Written in Odin. Runs on Windows (Win32 console) and on POSIX terminals
 | Key | Action |
 | --- | --- |
 | `Ctrl-B` | toggle the file tree (focus moves into it; `Esc` returns to the editor) |
-| `Ctrl-R` | build the project (`odin build <root>`, output goes to a temp dir) |
+| `Ctrl-K` | `odin check` the current buffer's package |
+| `Ctrl-R` | `odin build` the current buffer's package |
+| `Ctrl-T` | `odin run` the current buffer's package, output in the panel |
 | `Ctrl-E` | show/hide the build panel |
 | `Ctrl-S` | save the current buffer |
 | `Ctrl-O` | open a file by path |
@@ -40,6 +45,18 @@ Written in Odin. Runs on Windows (Win32 console) and on POSIX terminals
 In the file tree: arrows move, `Enter` opens a file or toggles a directory,
 `Right`/`Left` expand/collapse, `r` re-scans. In the build panel: arrows move,
 `Enter` jumps to the diagnostic, `c` clears the panel.
+
+### A note on "the current file"
+
+Odin compiles **packages**, not files (`odin build -file` treats one file as a
+whole package, which fails as soon as the directory has more than one). So the
+tool keys run in the directory of the buffer on screen — i.e. on the package the
+current file belongs to. For a scratch program that is alone in its directory
+that is the same thing as running that file.
+
+`Ctrl-T` captures the program's stdout/stderr, so programs that read from stdin
+(interactive TUIs, prompts) are not usable this way: give the process no input
+and it exits immediately.
 
 The cursor position, file type, buffer number and focus are shown in the status
 bar; the right side of the tab bar shows the project name or the last build

@@ -427,55 +427,89 @@ set_build_status :: proc(s: string) {
     IDE.build_status = strings.clone(s)
 }
 
-build_run :: proc() {
-    if IDE.root == "" {
+// Which Odin tool to invoke. Odin compiles *packages*, not files, so every one
+// of these runs in the directory of the current buffer (i.e. on its package).
+Tool :: enum {
+    Build, // odin build .  -out:<temp>   -> produces a binary
+    Check, // odin check .                -> diagnostics only, no codegen
+    Run,   // odin run .                  -> build and execute, output captured
+}
+
+tool_name :: proc(t: Tool) -> string {
+    switch t {
+    case .Build: return "build"
+    case .Check: return "check"
+    case .Run:   return "run"
+    }
+    return "build"
+}
+
+// Directory of the current buffer, falling back to the project root.
+current_package_dir :: proc() -> string {
+    if E.filename != "" {
+        if d := path_dir(E.filename); d != "" do return d
+    }
+    return IDE.root
+}
+
+build_run :: proc() { tool_run(.Build) }
+tool_check :: proc() { tool_run(.Check) }
+tool_compile_run :: proc() { tool_run(.Run) }
+
+tool_run :: proc(tool: Tool) {
+    dir := current_package_dir()
+    if dir == "" {
         set_status_message("No project root; open a file first")
         return
     }
 
+    name := tool_name(tool)
+
     build_clear()
     IDE.build_visible = true
-    set_build_status("building...")
+    set_build_status(fmt.tprintf("odin %s ...", name))
     IDE.build_ok = false
 
-    // Render the "building" state before blocking on the compiler.
+    // Render the "working" state before blocking on the compiler.
     refresh_screen()
-
-    td, terr := os.temp_directory(context.allocator)
-    if terr != nil do td = strings.clone(".")
-    defer delete(td)
-
-    out_dir := path_join(td, "olio-build")
-    defer delete(out_dir)
-    os.make_directory_all(out_dir)
-
-    base := path_base(IDE.root)
-    if base == "" || base == "." do base = "app"
-    exe_name: string
-    when ODIN_OS == .Windows {
-        exe_name = strings.concatenate({base, ".exe"})
-    } else {
-        exe_name = strings.clone(base)
-    }
-    defer delete(exe_name)
-
-    out_file := path_join(out_dir, exe_name)
-    defer delete(out_file)
-
-    out_arg := strings.concatenate({"-out:", out_file})
-    defer delete(out_arg)
 
     // A dynamic array (not a `[]string{...}` literal) so that it is definitely
     // heap allocated and safe to free. IDE.odin is owned by the IDE state.
     command := make([dynamic]string, 0, 4, context.allocator)
     defer delete(command)
     append(&command, IDE.odin)
-    append(&command, "build")
+    append(&command, name)
     append(&command, ".")
-    append(&command, out_arg)
+
+    out_arg: string
+    out_file: string
+    if tool == .Build {
+        td, terr := os.temp_directory(context.allocator)
+        if terr != nil do td = strings.clone(".")
+        defer delete(td)
+
+        out_dir := path_join(td, "olio-build")
+        defer delete(out_dir)
+        os.make_directory_all(out_dir)
+
+        base := path_base(dir)
+        if base == "" || base == "." do base = "app"
+        exe_name: string
+        when ODIN_OS == .Windows {
+            exe_name = strings.concatenate({base, ".exe"})
+        } else {
+            exe_name = strings.clone(base)
+        }
+        defer delete(exe_name)
+
+        out_file = path_join(out_dir, exe_name)
+        out_arg = strings.concatenate({"-out:", out_file})
+        defer delete(out_arg)
+        append(&command, out_arg)
+    }
 
     desc := os.Process_Desc {
-        working_dir = IDE.root,
+        working_dir = dir,
         command     = command[:],
     }
 
@@ -498,20 +532,28 @@ build_run :: proc() {
     build_text(string(stdout))
     build_text(string(stderr))
 
+    // `check` and `build` diagnose; `run` also prints the program's own output,
+    // which must not be counted as diagnostics.
     errors := 0
-    for l in IDE.build_lines {
-        if l.kind == .Error do errors += 1
+    if tool != .Run {
+        for l in IDE.build_lines {
+            if l.kind == .Error do errors += 1
+        }
     }
 
     if state.exit_code == 0 {
         IDE.build_ok = true
-        set_build_status(fmt.tprintf("build ok  %d ms", elapsed))
-        set_status_message("Build ok in %d ms", elapsed)
+        set_build_status(fmt.tprintf("%s ok  %d ms", name, elapsed))
+        set_status_message("%s ok in %d ms", name, elapsed)
+    } else if tool == .Run {
+        IDE.build_ok = false
+        set_build_status(fmt.tprintf("%s exit %d  %d ms", name, state.exit_code, elapsed))
+        set_status_message("%s exited with %d", name, state.exit_code)
     } else {
         err_word := errors == 1 ? "error" : "errors"
         IDE.build_ok = false
         set_build_status(fmt.tprintf("%d %s  exit %d  %d ms", errors, err_word, state.exit_code, elapsed))
-        set_status_message("Build failed: %d %s", errors, err_word)
+        set_status_message("%s failed: %d %s", name, errors, err_word)
     }
 
     // Focus the first diagnostic that points at a file.
@@ -788,7 +830,7 @@ draw_build_panel :: proc(b: ^bytes.Buffer) {
     // Header.
     goto_rc(b, top, 1)
     put(b, "\x1b[0m\x1b[K")
-    hint := "Ctrl-R build | Enter jump | Ctrl-E close"
+    hint := "Ctrl-R build | Ctrl-K check | Ctrl-T run | Enter jump | Ctrl-E close"
     title := fmt.tprintf(" %s", IDE.build_status)
     if IDE.build_ok {
         put(b, "\x1b[32m")
@@ -912,6 +954,12 @@ ide_handle_key :: proc(k: Key) -> bool {
             return true
         case cntl_key('r'):
             build_run()
+            return true
+        case cntl_key('k'):
+            tool_check()
+            return true
+        case cntl_key('t'):
+            tool_compile_run()
             return true
         case cntl_key('e'):
             IDE.build_visible = !IDE.build_visible
