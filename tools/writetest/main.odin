@@ -35,10 +35,8 @@ try_write :: proc(dir: string) {
 		fmt.printf("FAIL  %s  (WriteFile error %v)\n", path, win32.GetLastError())
 		return
 	}
-	win32.CloseHandle(h)
 	os.remove(path)
 	fmt.printf("OK    %s\n", path)
-	delete(path)
 }
 
 check_token :: proc() {
