@@ -11,17 +11,23 @@ Written in Odin. Runs on Windows (Win32 console) and on POSIX terminals
 
 ## Features
 
-- Odin syntax highlighting, line numbers, control-character display, hard tabs
-- Multiple buffers in a tab bar, per-buffer cursor/scroll/dirty state
+- Odin syntax highlighting, plus keyword highlighting for C/C++, Python, shell, JSON, HTML and Makefiles, and a small Markdown pass (headings, fences, inline code). Hard tabs, line numbers, control-character display
+- UTF-8 editing: the cursor, Backspace and Delete step by codepoint. Display columns count one cell per rune (CJK stays width 1)
+- Undo and redo (`Ctrl-Z` / `Ctrl-Y`), up to 200 steps. Typed ASCII is one step per character; a multi-byte rune is one step. Replace-all is a single step
+- Selection with Shift-arrows, `Ctrl-A` and `Ctrl-L`. Copy, cut and paste (`Ctrl-C` / `Ctrl-X` / `Ctrl-V`). With no selection, cut and copy are linewise
+- On Windows, copy and paste use the system clipboard (`CF_UNICODETEXT`). On Linux and macOS, copy emits OSC 52 and paste uses olio's own clipboard; a terminal paste (often `Ctrl-Shift-V`) is inserted via bracketed paste
+- Enter keeps the current line's indent. Home toggles column 0 and the first non-blank. `Ctrl-Left` / `Ctrl-Right` move by word. `Ctrl-Home` / `Ctrl-End` jump to the buffer edges. `Ctrl-D` duplicates the line
+- Multiple buffers in a tab bar, per-buffer cursor, scroll, selection, undo and dirty state
 - Project file tree with expand/collapse (`Ctrl-B`)
 - Odin toolchain integration, run on the package of the current buffer:
   - `Ctrl-K` `odin check` — diagnostics only, no codegen (fastest feedback)
   - `Ctrl-R` `odin build` — binary goes to a temp dir, so it never locks `olio.exe`
   - `Ctrl-T` `odin run` — builds and executes, the program's output lands in the panel
   - diagnostics are listed by kind and `Enter` opens the file at `file(line:col)`
-- Find (`Ctrl-F`), save (`Ctrl-S`), go to line (`Ctrl-G`), open by path (`Ctrl-O`)
-- CRLF and UTF-8 BOM tolerant file loading
-- Undo-free, dependency-free, under 2.1k lines of Odin
+- Find (`Ctrl-F`, case-insensitive by default; `Alt-C` toggles case; `F3` / `Shift-F3` repeat), replace all (`F2`, one undo step), save (`Ctrl-S`), go to line (`Ctrl-G`), open by path (`Ctrl-O`)
+- Recent files (`Alt-R`): `%APPDATA%\olio\recent` on Windows, `~/.config/olio/recent` elsewhere
+- CRLF is preserved. A new empty file on Windows is saved as CRLF; elsewhere as LF. A leading UTF-8 BOM is skipped on load
+- `F1` lists the keys. `F5` remeasures the window
 
 ![build error and jump](./screenshots/error/03_jumped_to_error.png)
 
@@ -38,7 +44,21 @@ Written in Odin. Runs on Windows (Win32 console) and on POSIX terminals
 | `Ctrl-O` | open a file by path |
 | `Ctrl-N` / `Ctrl-P` | next / previous buffer |
 | `Ctrl-W` | close the current buffer |
-| `Ctrl-F` | incremental find |
+| `Ctrl-F` | find (case-insensitive until `Alt-C`; arrows jump while the prompt is open) |
+| `F3` / `Shift-F3` | next / previous match of the last query |
+| `F2` | replace every match (one undo step; empty replacement deletes) |
+| `Alt-C` | toggle case-sensitive search |
+| `Ctrl-Z` / `Ctrl-Y` | undo / redo |
+| `Ctrl-A` / `Ctrl-L` | select all / select line |
+| Shift-arrows | extend the selection |
+| `Ctrl-C` / `Ctrl-X` / `Ctrl-V` | copy / cut / paste |
+| `Ctrl-D` | duplicate the current line |
+| `Ctrl-Left` / `Ctrl-Right` | previous / next word |
+| `Home` | toggle column 0 and the first non-blank column |
+| `Ctrl-Home` / `Ctrl-End` | start / end of the buffer |
+| `Alt-R` | recent files |
+| `F1` | key list |
+| `F5` | remeasure the window |
 | `Ctrl-G` | go to line |
 | `Ctrl-Q` | quit (three presses if the buffer is dirty) |
 
@@ -65,12 +85,15 @@ result.
 ## Build and run
 
 ```powershell
-odin build . -out:olio.exe
+odin check . -vet -target:windows_amd64
+odin build . -vet -out:olio.exe
 .\olio.exe                 # empty buffer, file tree rooted at the cwd
 .\olio.exe src\main.odin   # open a file, project root becomes its directory
 ```
 
-On Linux/macOS the same commands work with `olio` as the output name.
+`odin check` type-checks the Windows sources (`term_windows.odin`) without producing a binary. `odin build` on Windows produces `olio.exe`. On Linux/macOS the same check is `odin check . -vet` and the build is `odin build . -vet -out:olio`.
+
+These were verified with Odin `dev-2026-11-nightly` (`dev-2026-11a`, commit `9a69916`).
 
 Set `OLIO_ODIN` to point at a specific compiler if `odin` is not on `PATH`
 (otherwise olio looks for `odin.exe` on `PATH`, then in `%USERPROFILE%\Odin`):
@@ -169,10 +192,12 @@ $sc.Save()
 
 | File | Contents |
 | --- | --- |
-| `olio.odin` | editor core: rows, keys, syntax highlighting, find, save/load, main loop |
-| `ide.odin` | buffers, file tree, build runner, diagnostics, screen layout, key routing |
-| `term_windows.odin` | Win32 console raw mode, window size, resize polling |
-| `term_unix.odin` | POSIX `termios` raw mode, window size via cursor-position report |
+| `olio.odin` | editor core: rows, keys, syntax highlighting, save/load, main loop |
+| `edit.odin` | UTF-8 motion, undo/redo, selection, find/replace, indent |
+| `edit_test.odin` | tests for those operations (`odin test . -vet`) |
+| `ide.odin` | buffers, file tree, build runner, diagnostics, screen layout, key routing, help, recent files |
+| `term_windows.odin` | Win32 console raw mode, resize polling, system clipboard |
+| `term_unix.odin` | POSIX `termios` raw mode, `ioctl` window size, OSC 52 copy |
 
 See [PORTING.md](./PORTING.md) for the platform notes.
 
@@ -204,10 +229,32 @@ odin run tools/savetest
 ```
 
 ## Limitations
-- Terminal resize is detected on Windows only; the POSIX path keeps the size
-  measured at startup.
 - The build is synchronous: the UI waits for `odin build` to finish (it renders a
   "building..." state first).
-- No undo, no LSP, no auto-indent. It is a small editor, on purpose.
+- No LSP, no mouse, no split panes, no soft wrap. CJK characters are one column wide.
+- Python triple-quotes are treated as a kilo-style multi-line comment, not as a
+  string that can end on the same line.
+- Search folds ASCII case only.
+- On Linux and macOS, `Ctrl-V` cannot read the desktop clipboard (there is no
+  portable read). Copy still sends OSC 52 for terminals that honour it, and a
+  terminal paste is inserted through bracketed paste.
+
+## Credit
+
+The editing ideas added in 0.5 — per-codepoint cursor motion, undo/redo,
+selection, word motion, smart indent, case-insensitive find with replace-all,
+recent files, and bracketed paste — follow
+[JOHN](https://github.com/joaocarvalhoopen/John_simple_text_editor_in_Odin)
+by João Carvalho, which is distributed as MIT ("MIT Open Source License" in
+that repository's README and file headers; it does not ship a separate
+`LICENSE` file). They were reimplemented against olio's kilo-style rows.
+John's sources are not included here.
+
+Left in JOHN, and not brought over: recursive splits and mouse selection
+(they would replace olio's layout, and Windows mouse input is a different
+API), the menu bar, the `~/.config/john/keys.conf` keymap (several of those
+chords are already olio's `odin check` / build / run keys), code completion,
+the double-buffered cell renderer, soft wrap, and the long per-language
+lexers.
 
 Inspired by [kilo](https://github.com/antirez/kilo).

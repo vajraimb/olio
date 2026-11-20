@@ -4,11 +4,32 @@ package olio
 // POSIX implementation of the terminal layer, moved verbatim out of olio.odin
 // so that the editor core is platform independent.
 
+import "core:c"
+import "core:encoding/base64"
 import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sys/posix"
+
+when ODIN_OS == .Darwin {
+	foreign import clib "system:System"
+} else {
+	foreign import clib "system:c"
+}
+
+@(default_calling_convention = "c")
+foreign clib {
+	@(link_name = "ioctl")
+	c_ioctl :: proc(fd: c.int, request: c.ulong, arg: rawptr) -> c.int ---
+}
+
+Win_Size :: struct {
+	row, col, xpixel, ypixel: u16,
+}
+
+// Linux 0x5413. Darwin/FreeBSD/NetBSD/OpenBSD use the same _IOR('t', 104, winsize).
+TIOCGWINSZ :: c.ulong(0x5413) when ODIN_OS == .Linux else c.ulong(0x40087468)
 
 Term_Mode :: posix.termios
 
@@ -59,9 +80,12 @@ enable_raw_mode :: proc() {
 	raw.c_cc[posix.Control_Char.VMIN] = 0
 	raw.c_cc[posix.Control_Char.VTIME] = 1
 	if posix.tcsetattr(posix.STDIN_FILENO, posix.TC_Optional_Action.TCSAFLUSH, &raw) != posix.result.OK do die("tcsetattr error")
+	// Bracketed paste: the terminal wraps external pastes in ESC[200~ ... ESC[201~.
+	os.write_string(os.stdout, "\x1b[?2004h")
 }
 
 disable_raw_mode :: proc() {
+	os.write_string(os.stdout, "\x1b[?2004l")
 	if posix.tcsetattr(posix.STDIN_FILENO, posix.TC_Optional_Action.TCSAFLUSH, &E.origin_mode) != posix.result.OK do die("tcsetattr error")
 }
 
@@ -69,7 +93,7 @@ get_cursor_pos :: proc(conf: ^Config) -> Result {
 	buf: [dynamic]byte
 	if _, err := os.write_string(os.stdout, "\x1b[6n"); err != nil do return .Err // report active position
 	fmt.printf("\r\n")
-	for i in 0..<size_of(buf) - 1 {
+	for _ in 0 ..< 32 {
 		b: [1]byte
 		if _, err := os.read(os.stdin, b[:]); err != nil do break
 		if b[0] == 'R' do break
@@ -85,12 +109,43 @@ get_cursor_pos :: proc(conf: ^Config) -> Result {
 }
 
 get_window_size :: proc(conf: ^Config) -> Result {
+	if rows, cols, ok := poll_window_size(); ok {
+		conf.screen_row = rows
+		conf.screen_col = cols
+		return .Ok
+	}
 	if _, err := os.write_string(os.stdout, "\x1b[999C\x1b[999B"); err != nil do return .Err
 	return get_cursor_pos(conf)
 }
 
-// The POSIX path has no cheap resize poll (that would need an ioctl or another
-// cursor-position round-trip), so the size captured at startup is kept.
 poll_window_size :: proc() -> (rows, cols: int, ok: bool) {
-	return 0, 0, false
+	ws: Win_Size
+	ret := c_ioctl(1, TIOCGWINSZ, &ws)
+	if ret < 0 || ws.col == 0 || ws.row == 0 do return 0, 0, false
+	return int(ws.row), int(ws.col), true
+}
+
+// VMIN 0 / VTIME 1: a read with no input returns after 100ms.
+read_input :: proc() -> (b: byte, ok, timed_out: bool) {
+	buf: [1]byte
+	n, err := os.read(os.stdin, buf[:])
+	if err != nil do return 0, false, false
+	if n <= 0 do return 0, false, true
+	return buf[0], true, false
+}
+
+// OSC 52 so terminals that support it (Windows Terminal, xterm, kitty, …)
+// also update the system clipboard. Reading it back is not portable here;
+// bracketed paste covers inbound text.
+clipboard_set :: proc(data: []byte) -> bool {
+	if len(data) == 0 || len(data) > 64 * 1024 do return false
+	enc, err := base64.encode(data, allocator = context.temp_allocator)
+	if err != nil do return false
+	msg := fmt.tprintf("\x1b]52;c;%s\x07", enc)
+	os.write_string(os.stdout, msg)
+	return true
+}
+
+clipboard_get :: proc() -> ([]byte, bool) {
+	return nil, false
 }
