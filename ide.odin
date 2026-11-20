@@ -104,6 +104,12 @@ Ide_Buf :: struct {
     coloff:   int,
     dirty:    int,
     syntax:   ^Syntax,
+    undo, redo: [dynamic]Edit,
+    saved_undo_len: int,
+    sel_on: bool,
+    sel_cx, sel_cy: int,
+    want_rx: int,
+    crlf: bool,
 }
 
 Sidebar_Entry :: struct {
@@ -150,6 +156,18 @@ Ide :: struct {
     build_off:        int,
     build_status:     string,
     build_ok:         bool,
+
+    overlay:          Overlay,
+    help_scroll:      int,
+    recent_sel:       int,
+    recent:           [dynamic]string,
+    recent_file:      string,
+}
+
+Overlay :: enum {
+    None,
+    Help,
+    Recent,
 }
 
 IDE: Ide
@@ -167,6 +185,12 @@ buf_stash :: proc() {
     b.rowoff, b.coloff = E.rowoff, E.coloff
     b.dirty = E.dirty
     b.syntax = E.syntax
+    b.undo, b.redo = E.undo, E.redo
+    b.saved_undo_len = E.saved_undo_len
+    b.sel_on = E.sel_on
+    b.sel_cx, b.sel_cy = E.sel_cx, E.sel_cy
+    b.want_rx = E.want_rx
+    b.crlf = E.crlf
 }
 
 buf_load :: proc(i: int) {
@@ -179,11 +203,18 @@ buf_load :: proc(i: int) {
     E.rowoff, E.coloff = b.rowoff, b.coloff
     E.dirty = b.dirty
     E.syntax = b.syntax
+    E.undo, E.redo = b.undo, b.redo
+    E.saved_undo_len = b.saved_undo_len
+    E.sel_on = b.sel_on
+    E.sel_cx, E.sel_cy = b.sel_cx, b.sel_cy
+    E.want_rx = b.want_rx
+    E.crlf = b.crlf
     IDE.active = i
 }
 
 buf_switch :: proc(i: int) {
     if i == IDE.active || i < 0 || i >= len(IDE.bufs) do return
+    clear_find_hl()
     buf_stash()
     buf_load(i)
 }
@@ -197,6 +228,14 @@ clear_editor :: proc() {
     E.dirty = 0
     E.syntax = nil
     E.filename = ""
+    // Detach, don't free: the buffer slot we just stashed still owns these.
+    E.undo = {}
+    E.redo = {}
+    E.saved_undo_len = 0
+    E.sel_on = false
+    E.sel_cx, E.sel_cy = 0, 0
+    E.want_rx = 0
+    E.crlf = ODIN_OS == .Windows
 }
 
 buf_open :: proc(path_in: string) -> bool {
@@ -215,6 +254,7 @@ buf_open :: proc(path_in: string) -> bool {
         return false
     }
 
+    clear_find_hl()
     buf_stash()
 
     reuse := len(IDE.bufs) == 1 && IDE.bufs[0].filename == "" && IDE.bufs[0].num_rows == 0
@@ -251,6 +291,7 @@ buf_open_new :: proc(path_in: string) -> bool {
         }
     }
 
+    clear_find_hl()
     buf_stash()
     reuse := len(IDE.bufs) == 1 && IDE.bufs[0].filename == "" && IDE.bufs[0].num_rows == 0
     if !reuse {
@@ -267,10 +308,13 @@ buf_open_new :: proc(path_in: string) -> bool {
 
 buf_close :: proc(i: int) {
     if i < 0 || i >= len(IDE.bufs) do return
+    if i == IDE.active do clear_find_hl()
 
     if len(IDE.bufs) == 1 {
         // Never leave the editor without a buffer: reset it instead.
         for &r in E.row do free_row(&r)
+        free_edits(&E.undo)
+        free_edits(&E.redo)
         clear_editor()
         buf_stash()
         set_status_message("Buffer cleared")
@@ -280,6 +324,15 @@ buf_close :: proc(i: int) {
     b := &IDE.bufs[i]
     for &r in b.rows do free_row(&r)
     delete(b.rows)
+    if i == IDE.active {
+        free_edits(&E.undo)
+        free_edits(&E.redo)
+        b.undo = {}
+        b.redo = {}
+    } else {
+        free_edits(&b.undo)
+        free_edits(&b.redo)
+    }
     if b.filename != "" do delete(b.filename)
     ordered_remove(&IDE.bufs, i)
 
@@ -690,9 +743,9 @@ clip_runes :: proc(s: string, width: int) -> string {
 }
 
 put_padded :: proc(b: ^bytes.Buffer, s: string, width: int) {
-    s := clip_runes(s, width)
-    put(b, s)
-    put_repeat(b, " ", width - utf8.rune_count(s))
+    clipped := clip_runes(s, width)
+    put(b, clipped)
+    put_repeat(b, " ", width - utf8.rune_count(clipped))
 }
 
 draw_tab_bar :: proc(b: ^bytes.Buffer) {
@@ -817,36 +870,51 @@ draw_editor_rows :: proc(b: ^bytes.Buffer) {
             put(b, line_f)
             put(b, "\x1b[m")
 
-            if E.coloff < E.row[filerow].rsize {
-                remain := E.row[filerow].rsize - E.coloff
-                n := min(remain, text_width)
-                c := E.row[filerow].render[E.coloff:]
-                hl := E.row[filerow].hl[E.coloff:]
-                current_color := -1
-                for j in 0..<n {
-                    if is_cntl(c[j]) {
-                        sym := c[j] <= 26 ? '@' + c[j] : byte('?')
-                        put(b, "\x1b[7m")
-                        bytes.buffer_write_byte(b, sym)
-                        put(b, "\x1b[m")
-                        if current_color != -1 {
-                            put(b, fmt.tprintf("\x1b[%dm", current_color))
-                        }
-                    } else if hl[j] == .Hl_Normal {
-                        if current_color != -1 {
-                            put(b, "\x1b[39m")
-                            current_color = -1
-                        }
-                        bytes.buffer_write_byte(b, c[j])
-                    } else {
-                        color := syntax_to_color(hl[j])
-                        if color != current_color {
-                            current_color = color
-                            put(b, fmt.tprintf("\x1b[%dm", color))
-                        }
-                        bytes.buffer_write_byte(b, c[j])
-                    }
+            sel_from, sel_to, has_sel := selection_cols(filerow)
+            render := E.row[filerow].render[:]
+            hl := E.row[filerow].hl[:]
+            current_color := -1
+            col := 0
+            i := 0
+            for i < len(render) {
+                _, n := utf8.decode_rune(render[i:])
+                if n <= 0 do n = 1
+                if i + n > len(render) do n = 1
+                if col < E.coloff {
+                    col += 1
+                    i += n
+                    continue
                 }
+                if col - E.coloff >= text_width do break
+                selected := has_sel && col >= sel_from && col < sel_to
+                if selected {
+                    put(b, "\x1b[30;43m")
+                    current_color = -1
+                    if is_cntl(render[i]) {
+                        sym := render[i] <= 26 ? '@' + render[i] : byte('?')
+                        bytes.buffer_write_byte(b, sym)
+                    } else {
+                        bytes.buffer_write(b, render[i:i + n])
+                    }
+                } else if is_cntl(render[i]) {
+                    sym := render[i] <= 26 ? '@' + render[i] : byte('?')
+                    put(b, "\x1b[7m")
+                    bytes.buffer_write_byte(b, sym)
+                    put(b, "\x1b[m")
+                    if current_color != -1 {
+                        put(b, fmt.tprintf("\x1b[%dm", current_color))
+                    }
+                } else {
+                    color := 39
+                    if i < len(hl) && hl[i] != .Hl_Normal do color = syntax_to_color(hl[i])
+                    if color != current_color {
+                        current_color = color
+                        put(b, fmt.tprintf("\x1b[%dm", color))
+                    }
+                    bytes.buffer_write(b, render[i:i + n])
+                }
+                col += 1
+                i += n
             }
             put(b, "\x1b[39m")
         }
@@ -923,8 +991,9 @@ draw_status_bar :: proc(b: ^bytes.Buffer) {
 
     left := fmt.tprintf(" %s  %d lines", name, E.num_rows)
     ft := E.syntax != nil ? E.syntax.filetype : "text"
-    right := fmt.tprintf("%s | Ln %d, Col %d | %d/%d | %s ",
-        ft, E.cy + 1, E.cx + 1, IDE.active + 1, len(IDE.bufs), IDE.focus == .Sidebar ? "files" : IDE.focus == .Build ? "build" : "edit")
+    eol := E.crlf ? "CRLF" : "LF"
+    right := fmt.tprintf("%s %s | Ln %d, Col %d | %d/%d | %s ",
+        eol, ft, E.cy + 1, E.rx + 1, IDE.active + 1, len(IDE.bufs), IDE.focus == .Sidebar ? "files" : IDE.focus == .Build ? "build" : "edit")
 
     lw := utf8.rune_count(left)
     rw := utf8.rune_count(right)
@@ -958,6 +1027,7 @@ refresh_screen :: proc() {
     draw_tab_bar(&b)
     draw_sidebar(&b)
     draw_editor_rows(&b)
+    draw_overlay(&b)
     draw_build_panel(&b)
     draw_status_bar(&b)
     draw_msg_bar(&b)
@@ -980,7 +1050,47 @@ refresh_screen :: proc() {
 ide_handle_key :: proc(k: Key) -> bool {
     // Chords that work from any panel.
     #partial switch v in k {
+    case Arrow:
+        #partial switch v {
+        case .F1:
+            if IDE.overlay == .Help do IDE.overlay = .None
+            else {
+                IDE.overlay = .Help
+                IDE.help_scroll = 0
+            }
+            return true
+        case .F5:
+            if rows, cols, ok := poll_window_size(); ok {
+                IDE.win_row, IDE.win_col = rows, cols
+            }
+            set_status_message("Screen %d x %d", IDE.win_col, IDE.win_row)
+            return true
+        case .F2:
+            if IDE.focus != .Editor do return false
+            editor_replace()
+            return true
+        case .F3:
+            if IDE.focus != .Editor do return false
+            find_move(.Shift in key_mods ? -1 : 1)
+            return true
+        case .Paste:
+            if IDE.focus != .Editor do return false
+            paste_pending()
+            return true
+        }
     case byte:
+        if .Alt in key_mods {
+            switch v {
+            case 'r', 'R':
+                open_recent()
+                return true
+            case 'c', 'C':
+                search_case = !search_case
+                set_status_message("Search is %s", search_case ? "case-sensitive" : "case-insensitive")
+                return true
+            }
+            return true
+        }
         switch v {
         case cntl_key('b'):
             sidebar_toggle()
@@ -1041,7 +1151,7 @@ ide_handle_key :: proc(k: Key) -> bool {
 sidebar_key :: proc(k: Key) -> bool {
     #partial switch v in k {
     case Arrow:
-        switch v {
+        #partial switch v {
         case .Arrow_Up:      if IDE.sel > 0 do IDE.sel -= 1
         case .Arrow_Down:    if IDE.sel + 1 < len(IDE.entries) do IDE.sel += 1
         case .Page_Up:       IDE.sel = max(0, IDE.sel - E.screen_row)
@@ -1102,9 +1212,9 @@ build_key :: proc(k: Key) -> bool {
 }
 
 ide_open_prompt :: proc() {
-    name := editor_prompt("Open: %s (ESC to cancel)", nil)
+    name, prompt_ok := editor_prompt("Open: %s (ESC to cancel)", nil)
     defer delete(name)
-    if name == "" do return
+    if !prompt_ok || name == "" do return
 
     p := name
     owned := false
@@ -1134,9 +1244,9 @@ ide_open_prompt :: proc() {
 }
 
 ide_goto_prompt :: proc() {
-    s := editor_prompt("Go to line: %s", nil)
+    s, prompt_ok := editor_prompt("Go to line: %s", nil)
     defer delete(s)
-    if s == "" do return
+    if !prompt_ok || s == "" do return
     n, ok := strconv.parse_int(s)
     if !ok do return
     editor_goto(n, 0)
@@ -1199,6 +1309,7 @@ ide_init :: proc() {
     append(&IDE.bufs, Ide_Buf{})
     IDE.active = 0
     buf_stash()
+    recent_load()
 }
 
 ide_set_root :: proc(dir: string) {
@@ -1215,5 +1326,221 @@ ide_set_root_from_file :: proc(path: string) {
     if IDE.root != "" && IDE.root == dir do return
     if IDE.root == "" || len(IDE.bufs) <= 1 {
         ide_set_root(dir)
+    }
+}
+
+/* ------------------------------------------------------- help & recent */
+
+Help_Lines := []string {
+    "Olio  —  F1 or Esc closes this list",
+    "",
+    "File",
+    "  Ctrl-S save    Ctrl-O open    Ctrl-W close buffer",
+    "  Ctrl-N / Ctrl-P next / previous buffer    Alt-R recent files",
+    "  Ctrl-Q quit (three times if the buffer is dirty)",
+    "",
+    "Edit",
+    "  Ctrl-Z undo    Ctrl-Y redo",
+    "  Ctrl-A select all    Ctrl-L select line    Shift-arrows extend",
+    "  Ctrl-C copy    Ctrl-X cut    Ctrl-V paste",
+    "  Ctrl-D duplicate line    Ctrl-Left / Ctrl-Right word",
+    "  Home toggles first column and the indent",
+    "  Enter keeps the current line's indent",
+    "",
+    "Search",
+    "  Ctrl-F find    F3 next    Shift-F3 previous    F2 replace",
+    "  Alt-C toggles case-sensitive search",
+    "",
+    "Project",
+    "  Ctrl-B file tree    Ctrl-K check    Ctrl-R build    Ctrl-T run",
+    "  Ctrl-E build panel    Ctrl-G go to line    F5 refresh size",
+    "",
+    "Ctrl-V reads the system clipboard on Windows. On Linux and macOS",
+    "Ctrl-V pastes olio's own clipboard; the terminal paste (often",
+    "Ctrl-Shift-V) arrives as a bracketed paste and is inserted too.",
+}
+
+help_on_key :: proc(k: Key) {
+    switch v in k {
+    case Arrow:
+        page := max(1, IDE.win_row - 4)
+        #partial switch v {
+        case .F1, .Resize:
+            if v == .F1 do IDE.overlay = .None
+        case .Arrow_Up: if IDE.help_scroll > 0 do IDE.help_scroll -= 1
+        case .Arrow_Down: IDE.help_scroll += 1
+        case .Page_Up: IDE.help_scroll = max(0, IDE.help_scroll - page)
+        case .Page_Down: IDE.help_scroll += page
+        case .Home_Key: IDE.help_scroll = 0
+        case .End_Key: IDE.help_scroll = len(Help_Lines)
+        case:
+        }
+    case byte:
+        if v == '\x1b' do IDE.overlay = .None
+    }
+    max_scroll := max(0, len(Help_Lines) - (IDE.win_row - 3))
+    if IDE.help_scroll > max_scroll do IDE.help_scroll = max_scroll
+}
+
+draw_overlay :: proc(b: ^bytes.Buffer) {
+    if IDE.overlay == .None do return
+    lines: []string
+    title: string
+    scroll: int
+    if IDE.overlay == .Help {
+        lines = Help_Lines
+        title = " Help "
+        scroll = IDE.help_scroll
+    } else {
+        title = " Recent "
+        scroll = 0
+    }
+    top := 2
+    height := IDE.win_row - 3
+    if height < 1 do return
+    for r in 0 ..< height {
+        goto_rc(b, top + r, 1)
+        put(b, "\x1b[0m\x1b[K")
+        if r == 0 {
+            put(b, "\x1b[1;7m")
+            put(b, title)
+            put(b, "\x1b[0m")
+            continue
+        }
+        idx := scroll + r - 1
+        text := ""
+        if IDE.overlay == .Recent {
+            if idx >= 0 && idx < len(IDE.recent) {
+                mark := idx == IDE.recent_sel ? "> " : "  "
+                text = fmt.tprintf("%s%s", mark, IDE.recent[idx])
+            }
+        } else if idx >= 0 && idx < len(lines) {
+            text = lines[idx]
+        }
+        if text != "" {
+            if IDE.overlay == .Recent && idx == IDE.recent_sel do put(b, "\x1b[7m")
+            put(b, clip_runes(text, IDE.win_col))
+            put(b, "\x1b[0m")
+        }
+    }
+}
+
+recent_store_path :: proc() -> string {
+    when ODIN_OS == .Windows {
+        if app, ok := os.lookup_env("APPDATA", context.temp_allocator); ok && app != "" {
+            return path_norm(path_join(app, "olio/recent"))
+        }
+        if home, ok := os.lookup_env("USERPROFILE", context.temp_allocator); ok && home != "" {
+            return path_norm(path_join(home, ".olio/recent"))
+        }
+    } else {
+        if home, ok := os.lookup_env("HOME", context.temp_allocator); ok && home != "" {
+            return path_join(home, ".config/olio/recent")
+        }
+    }
+    return ""
+}
+
+recent_load :: proc() {
+    path := recent_store_path()
+    if path == "" do return
+    IDE.recent_file = path
+    data, err := read_file_raw(path)
+    if err != "" do return
+    defer delete(data)
+    start := 0
+    for i in 0 ..= len(data) {
+        if i == len(data) || data[i] == '\n' {
+            line := data[start:i]
+            if len(line) > 0 && line[len(line) - 1] == '\r' do line = line[:len(line) - 1]
+            if len(line) > 0 && len(IDE.recent) < 20 {
+                append(&IDE.recent, strings.clone_from_bytes(line))
+            }
+            start = i + 1
+        }
+    }
+}
+
+recent_save :: proc() {
+    if IDE.recent_file == "" {
+        IDE.recent_file = recent_store_path()
+    }
+    if IDE.recent_file == "" do return
+    dir := path_dir(IDE.recent_file)
+    if dir != "" {
+        os.make_directory_all(dir)
+    }
+    buf := make([dynamic]byte, 0, 256)
+    defer delete(buf)
+    for p, i in IDE.recent {
+        append(&buf, ..str_bytes(p))
+        if i + 1 < len(IDE.recent) do append(&buf, '\n')
+    }
+    if len(IDE.recent) > 0 do append(&buf, '\n')
+    write_file_raw(IDE.recent_file, buf[:])
+}
+
+recent_note :: proc(path: string) {
+    if path == "" do return
+    norm := path_norm(path)
+    defer delete(norm)
+    for p, i in IDE.recent {
+        if paths_equal(p, norm) {
+            delete(p)
+            ordered_remove(&IDE.recent, i)
+            break
+        }
+    }
+    inject_at(&IDE.recent, 0, strings.clone(norm))
+    for len(IDE.recent) > 20 {
+        delete(IDE.recent[len(IDE.recent) - 1])
+        pop(&IDE.recent)
+    }
+    recent_save()
+}
+
+open_recent :: proc() {
+    if len(IDE.recent) == 0 {
+        set_status_message("No recent files")
+        return
+    }
+    IDE.overlay = .Recent
+    IDE.recent_sel = 0
+}
+
+recent_on_key :: proc(k: Key) {
+    switch v in k {
+    case Arrow:
+        #partial switch v {
+        case .Arrow_Up: if IDE.recent_sel > 0 do IDE.recent_sel -= 1
+        case .Arrow_Down: if IDE.recent_sel + 1 < len(IDE.recent) do IDE.recent_sel += 1
+        case .Home_Key: IDE.recent_sel = 0
+        case .End_Key: IDE.recent_sel = max(0, len(IDE.recent) - 1)
+        case .F1:
+            IDE.overlay = .Help
+            IDE.help_scroll = 0
+        case:
+        }
+    case byte:
+        if v == '\x1b' {
+            IDE.overlay = .None
+            return
+        }
+        if v == '\r' {
+            if IDE.recent_sel < 0 || IDE.recent_sel >= len(IDE.recent) {
+                IDE.overlay = .None
+                return
+            }
+            path := IDE.recent[IDE.recent_sel]
+            IDE.overlay = .None
+            if fi, err := os.stat(path, context.allocator); err != nil || fi.type == .Directory {
+                set_status_message("Cannot open %s", path)
+                return
+            }
+            if buf_open(path) {
+                IDE.focus = .Editor
+                set_status_message("Opened %s", path_base(path))
+            }
+        }
     }
 }

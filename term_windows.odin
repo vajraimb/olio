@@ -7,6 +7,7 @@ package olio
 // API instead of a "cursor position report" escape sequence query.
 
 import "core:fmt"
+import "core:os"
 import win32 "core:sys/windows"
 
 /*
@@ -113,9 +114,12 @@ enable_raw_mode :: proc() {
 	if !win32.SetConsoleMode(out, E.origin_mode.output | win32.ENABLE_PROCESSED_OUTPUT | win32.ENABLE_VIRTUAL_TERMINAL_PROCESSING) {
 		die("SetConsoleMode(stdout) error")
 	}
+	// Bracketed paste, same sequence as on POSIX. Windows Terminal honors it.
+	os.write_string(os.stdout, "\x1b[?2004h")
 }
 
 disable_raw_mode :: proc() {
+	os.write_string(os.stdout, "\x1b[?2004l")
 	inp, out := _std_handles()
 	if inp == win32.INVALID_HANDLE || out == win32.INVALID_HANDLE do return
 	win32.SetConsoleMode(inp, E.origin_mode.input)
@@ -149,4 +153,95 @@ poll_window_size :: proc() -> (rows, cols: int, ok: bool) {
 	if width <= 0 || height <= 0 do return 0, 0, false
 
 	return height, width, true
+}
+
+// Wait up to 100ms so Escape can be told apart from an escape sequence, and
+// so a resize is noticed without a key. Window-size records are not bytes;
+// they are discarded here and reported as a timeout so the editor remeasures.
+read_input :: proc() -> (b: byte, ok, timed_out: bool) {
+	inp, _ := _std_handles()
+	for {
+		r := win32.WaitForSingleObject(inp, 100)
+		if r == win32.WAIT_TIMEOUT do return 0, false, true
+		if r != win32.WAIT_OBJECT_0 do return 0, false, false
+
+		rec: win32.INPUT_RECORD
+		n: win32.DWORD
+		if !win32.PeekConsoleInputW(inp, &rec, 1, &n) do return 0, false, false
+		if n == 0 do continue
+		if rec.EventType != .KEY_EVENT {
+			win32.ReadConsoleInputW(inp, &rec, 1, &n)
+			if rec.EventType == .WINDOW_BUFFER_SIZE_EVENT do return 0, false, true
+			continue
+		}
+		if !rec.Event.KeyEvent.bKeyDown {
+			win32.ReadConsoleInputW(inp, &rec, 1, &n)
+			continue
+		}
+		buf: [1]byte
+		got: win32.DWORD
+		if !win32.ReadFile(inp, rawptr(&buf[0]), 1, &got, nil) || got == 0 {
+			return 0, false, false
+		}
+		return buf[0], true, false
+	}
+}
+
+// The real Windows clipboard. Ctrl-C / Ctrl-V talk to other programs.
+clipboard_set :: proc(data: []byte) -> bool {
+	u16s: []u16
+	if len(data) > 0 {
+		u16s = win32.utf8_to_utf16(string(data), context.temp_allocator)
+		if u16s == nil do return false
+	}
+	if !win32.OpenClipboard(nil) do return false
+	defer win32.CloseClipboard()
+
+	nchars := len(u16s) + 1
+	nbytes := win32.SIZE_T(nchars * 2)
+	mem := win32.GlobalAlloc(win32.GHND, nbytes)
+	if mem == nil do return false
+	hg := cast(win32.HGLOBAL)mem
+	ptr := win32.GlobalLock(hg)
+	if ptr == nil {
+		win32.GlobalFree(mem)
+		return false
+	}
+	if len(u16s) > 0 {
+		mem_copy(ptr, raw_data(u16s), len(u16s) * 2)
+	}
+	win32.GlobalUnlock(hg)
+	// Empty only once the replacement is ready, so a failed alloc leaves
+	// the previous clipboard contents alone.
+	win32.EmptyClipboard()
+	if win32.SetClipboardData(win32.CF_UNICODETEXT, cast(win32.HANDLE)hg) == nil {
+		win32.GlobalFree(mem)
+		return false
+	}
+	return true
+}
+
+clipboard_get :: proc() -> (data: []byte, ok: bool) {
+	if !win32.OpenClipboard(nil) do return nil, false
+	defer win32.CloseClipboard()
+	h := win32.GetClipboardData(win32.CF_UNICODETEXT)
+	if h == nil do return nil, false
+	hg := cast(win32.HGLOBAL)h
+	ptr := win32.GlobalLock(hg)
+	if ptr == nil do return nil, false
+	defer win32.GlobalUnlock(hg)
+	ws := cast(win32.wstring)ptr
+	s, err := win32.wstring_to_utf8_alloc(ws, -1, context.allocator)
+	if err != nil do return nil, false
+	out := make([]byte, len(s))
+	copy(out, s)
+	delete(s)
+	return out, true
+}
+
+mem_copy :: proc(dst, src: rawptr, n: int) {
+	if n <= 0 || dst == nil || src == nil do return
+	d := ([^]byte)(dst)
+	s := ([^]byte)(src)
+	for i in 0 ..< n do d[i] = s[i]
 }

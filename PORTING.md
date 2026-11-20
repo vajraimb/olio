@@ -12,8 +12,9 @@ new IDE layer on top of the editor core.
 | --- | --- |
 | `olio.odin` | Editor core. No longer imports `core:sys/posix` and no longer owns the screen layout. |
 | `ide.odin` | Buffers, file tree, build runner, diagnostics, layout and all drawing. |
-| `term_windows.odin` | `#+build windows`. Raw mode via `GetConsoleMode`/`SetConsoleMode` (no echo, no line buffering, no Ctrl-C/Ctrl-S processing, `ENABLE_VIRTUAL_TERMINAL_INPUT` so arrow keys arrive as escape sequences, `ENABLE_VIRTUAL_TERMINAL_PROCESSING` so the ANSI drawing renders). Window size and resize polling via `GetConsoleScreenBufferInfo`. |
-| `term_unix.odin` | `#+build linux, darwin, netbsd, openbsd, freebsd`. The original POSIX implementation, moved out verbatim. |
+| `edit.odin` | UTF-8 motion, undo/redo, selection, clipboard, find/replace, indent. Shared by every target. |
+| `term_windows.odin` | `#+build windows`. Raw mode via `GetConsoleMode`/`SetConsoleMode` (no echo, no line buffering, no Ctrl-C/Ctrl-S processing, `ENABLE_VIRTUAL_TERMINAL_INPUT` so arrow keys arrive as escape sequences, `ENABLE_VIRTUAL_TERMINAL_PROCESSING` so the ANSI drawing renders). Window size via `GetConsoleScreenBufferInfo`. `read_input` waits at most 100ms (`WaitForSingleObject`) and peeks console records so a resize is not stuck behind `ReadFile`. The system clipboard is `CF_UNICODETEXT`. |
+| `term_unix.odin` | `#+build linux, darwin, netbsd, openbsd, freebsd`. POSIX `termios` raw mode. Window size tries `ioctl(TIOCGWINSZ)` first and falls back to the cursor-position report. `VMIN=0`, `VTIME=1` so a read wakes every 100ms and a resize is applied without a key. Copy writes OSC 52; there is no clipboard read. |
 
 `Config.origin_termios: posix.termios` became `Config.origin_mode: Term_Mode`,
 which each platform defines (`posix.termios` on Unix, the two saved console
@@ -21,8 +22,9 @@ modes on Windows).
 
 ## How the IDE layer hangs off the editor
 
-The editor core still edits exactly one buffer in the global `E`, so none of the
-editing code had to change. A buffer is a saved snapshot of that state:
+The editor core still edits exactly one buffer in the global `E`. A buffer is a
+saved snapshot of that state, including the undo and redo stacks, the selection
+and whether the file uses CRLF:
 
 ```odin
 Ide_Buf :: struct { filename: string, rows: [dynamic]E_Row, num_rows: int, ... }
@@ -71,15 +73,49 @@ area"), which is why the scrolling code did not need to change either.
   `path_norm` + `paths_equal` (case-insensitive on Windows). Without this, jumping
   to a diagnostic opened a duplicate tab for the file already on screen.
 
+## Input, clipboard, and line endings
+
+Escape sequences (arrows, F-keys, modified keys such as `Ctrl-Left` and
+`Shift-F3`) are parsed from the same CSI/SS3 bytes on every platform. Bracketed
+paste is turned on with `\x1b[?2004h` and arrives as `ESC [ 200 ~` ...
+`ESC [ 201 ~`. On Windows that only works when virtual-terminal input is
+enabled, which raw mode already sets; a resize record is consumed in
+`read_input` and reported as a timeout so the next frame calls
+`poll_window_size`.
+
+`Ctrl-C` / `Ctrl-V` keep an internal clipboard everywhere. On Windows they also
+read and write `CF_UNICODETEXT` (UTF-8 is converted before the clipboard is
+opened, and it is emptied only after the replacement block is allocated). On
+Linux and macOS there is no portable clipboard read, so `Ctrl-V` pastes the
+internal copy and a terminal paste comes in through bracketed paste. `Ctrl-H`
+is still Backspace, the way kilo delivers it, so replace is `F2` rather than
+`Ctrl-H`.
+
+Load strips `\r` and remembers that the file was CRLF. Save writes `\r\n` when
+that flag is set. A brand-new empty buffer defaults to CRLF on Windows and LF
+elsewhere. Recent-file paths are `%APPDATA%\olio\recent`, or
+`%USERPROFILE%\.olio\recent` when `APPDATA` is unset, and
+`~/.config/olio/recent` on Unix.
+
 ## Build and run
 
+From a Windows checkout, with a current Odin on `PATH`:
+
 ```powershell
-odin build . -out:olio.exe
+odin check . -vet -target:windows_amd64
+odin build . -vet -out:olio.exe
 .\olio.exe olio.odin
 ```
 
+`odin check -target:windows_amd64` type-checks `term_windows.odin` and skips
+`term_unix.odin`. On Linux the matching commands are `odin check . -vet` and
+`odin build . -vet -out:olio`. `odin test . -vet` runs the editing tests; they
+share the global editor and take a lock so the default thread count is safe.
+
 `odin build .` compiles *every* `.odin` file in the directory, so scratch files
-must live outside the package directory (the helper scripts do).
+must live outside the package directory (the helper scripts do). `edit_test.odin`
+is part of the package; `odin test` runs it and `odin build` ignores `@(test)`
+procedures.
 
 ## Verification helpers
 

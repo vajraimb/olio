@@ -4,10 +4,10 @@ import "core:os"
 import "core:fmt"
 import "core:slice"
 import "core:strings"
-import "core:strconv"
 import "core:bytes"
 import "core:time"
 import "core:math"
+import "core:unicode/utf8"
 
 E_Row :: struct {
     idx: int,
@@ -32,7 +32,13 @@ Config :: struct {      // editor's config
     filename: string,
     status_msg: string,
     status_msg_time: time.Time,
-    syntax: ^Syntax
+    syntax: ^Syntax,
+    undo, redo: [dynamic]Edit,
+    saved_undo_len: int,
+    sel_on: bool,
+    sel_cx, sel_cy: int,
+    want_rx: int,
+    crlf: bool,
 }
 
 Buffer :: bytes.Buffer  // append buffer
@@ -71,7 +77,10 @@ Arrow :: enum {
     Page_Down,
     Home_Key,
     End_Key,
-    Del_Key
+    Del_Key,
+    F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+    Paste,
+    Resize,
 }
 
 Syntax_Flag :: enum {
@@ -90,10 +99,37 @@ Syntax :: struct {
     flags: bit_set[Syntax_Flag; u32]
 }
 
-C_Hl_Extensions := []string {".c", ".h", ".cpp"}
+C_Hl_Extensions := []string {".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"}
 C_Hl_Keywords := []string {
     "switch", "if", "while", "for", "break", "continue", "return", "else", "struct", "union", "typedef", "static", "enum", "class", "case",
     "int|", "long|", "double|", "float|", "char|", "unsigned|", "signed|", "void|"
+}
+
+Py_Hl_Extensions := []string {".py"}
+Py_Hl_Keywords := []string {
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def",
+    "del", "elif", "else", "except", "finally", "for", "from", "global", "if",
+    "import", "in", "is", "lambda", "nonlocal", "not", "or", "pass", "raise",
+    "return", "try", "while", "with", "yield",
+    "False|", "None|", "True|", "int|", "float|", "str|", "bool|", "list|", "dict|", "set|", "tuple|",
+}
+
+Sh_Hl_Extensions := []string {".sh", ".bash", ".zsh"}
+Sh_Hl_Keywords := []string {
+    "if", "then", "else", "elif", "fi", "for", "while", "until", "do", "done",
+    "case", "esac", "function", "return", "exit", "break", "continue", "in", "local",
+}
+
+Json_Hl_Extensions := []string {".json"}
+
+Md_Hl_Extensions := []string {".md", ".markdown"}
+
+Html_Hl_Extensions := []string {".html", ".htm"}
+Html_Hl_Keywords := []string {"html|", "head|", "body|", "div|", "span|", "script|", "style|"}
+
+Make_Hl_Extensions := []string {".mk"}
+Make_Hl_Keywords := []string {
+    "include", "ifeq", "ifneq", "ifdef", "ifndef", "else", "endif", "define", "endef",
 }
 
 Odin_Hl_Extensions := []string {".odin"}
@@ -131,10 +167,52 @@ Hl_Db := []Syntax {
         Odin_Hl_Keywords,
         "//", "/*", "*/",
         {.Hl_Highlight_Numbers, .Hl_Highlight_String, .Hl_Highlight_Escape}
-    }
+    },
+    Syntax {
+        "python",
+        Py_Hl_Extensions,
+        Py_Hl_Keywords,
+        "#", "\"\"\"", "\"\"\"",
+        {.Hl_Highlight_Numbers, .Hl_Highlight_String, .Hl_Highlight_Escape}
+    },
+    Syntax {
+        "shell",
+        Sh_Hl_Extensions,
+        Sh_Hl_Keywords,
+        "#", "", "",
+        {.Hl_Highlight_Numbers, .Hl_Highlight_String}
+    },
+    Syntax {
+        "json",
+        Json_Hl_Extensions,
+        nil,
+        "", "", "",
+        {.Hl_Highlight_Numbers, .Hl_Highlight_String, .Hl_Highlight_Escape}
+    },
+    Syntax {
+        "markdown",
+        Md_Hl_Extensions,
+        nil,
+        "", "", "",
+        {}
+    },
+    Syntax {
+        "html",
+        Html_Hl_Extensions,
+        Html_Hl_Keywords,
+        "", "<!--", "-->",
+        {.Hl_Highlight_String}
+    },
+    Syntax {
+        "make",
+        Make_Hl_Extensions,
+        Make_Hl_Keywords,
+        "#", "", "",
+        {}
+    },
 }
 
-Olio_Version := "0.4.0"
+Olio_Version := "0.5.0"
 Tab_Stop := 4
 Quit_Times := 3
 
@@ -186,6 +264,19 @@ editor_open :: proc (path: string) -> bool {
         file_start = 3
     }
 
+    E.crlf = false
+    if len(content) > file_start + 1 {
+        for i in file_start ..< len(content) - 1 {
+            if content[i] == '\r' && content[i + 1] == '\n' {
+                E.crlf = true
+                break
+            }
+        }
+    }
+    if len(content) == file_start {
+        E.crlf = ODIN_OS == .Windows
+    }
+
     start := file_start
     for i := file_start; i < len(content); i += 1 {
         if content[i] == '\n' {
@@ -200,7 +291,9 @@ editor_open :: proc (path: string) -> bool {
         if len(line) > 0 && line[len(line)-1] == '\r' do line = line[:len(line)-1]
         insert_row(E.num_rows, line)
     }
-    E.dirty = 0
+    reset_history()
+    clear_sel()
+    recent_note(E.filename)
     return true
 }
 
@@ -209,8 +302,10 @@ rows_to_string :: proc() -> ([]byte, int) {
     buf : [dynamic]byte
     for r in E.row {
         append(&buf, ..r.chars[:])
+        if E.crlf do append(&buf, '\r')
         append(&buf, '\n')
         totlen += r.size + 1
+        if E.crlf do totlen += 1
     }
     return buf[:], totlen
 } 
@@ -245,8 +340,9 @@ save_reason :: proc(path: string) -> string {
 editor_save :: proc() {
     was_unnamed := len(E.filename) == 0
     if was_unnamed {
-        name := editor_prompt("Save as: %s (ESC to cancel)", nil)
-        if name == "" {
+        name, name_ok := editor_prompt("Save as: %s (ESC to cancel)", nil)
+        if !name_ok || name == "" {
+            delete(name)
             set_status_message("Save aborted")
             return
         }
@@ -286,83 +382,183 @@ editor_save :: proc() {
     }
 
     set_status_message("%d bytes written to %s", written, path)
-    E.dirty = 0
+    mark_saved()
     select_syntax_highlight()
+    recent_note(path)
 }
 
+// One byte from the terminal. `timed_out` means the wait expired with no
+// input, so the caller can poll the window size and try again. A hard read
+// error reports ok=false and timed_out=false.
 read_key :: proc() -> Key {
-    buffer: [1]byte
+    key_mods = {}
     for {
-        nread, err := os.read(os.stdin, buffer[:])
-        if err != nil do die("read byte error")
-        if nread == 1 do break
-    }
-    c := buffer[0]
-    if c == '\x1b' {
-        seq: [3]byte
-        if nread, err := os.read(os.stdin, seq[0:1]); err != nil || nread != 1 do return '\x1b'
-        if nread, err := os.read(os.stdin, seq[1:2]); err != nil || nread != 1 do return '\x1b'
-        if seq[0] == '[' {
-            if seq[1] >= '0' && seq[1] <= '9' {
-                if nread, err := os.read(os.stdin, seq[2:3]); err != nil || nread != 1 do return '\x1b'
-                if seq[2] == '~' {
-                    switch seq[1] {
-                    case '1': return .Home_Key
-                    case '3': return .Del_Key
-                    case '4': return .End_Key
-                    case '5': return .Page_Up
-                    case '6': return .Page_Down
-                    case '7': return .Home_Key
-                    case '8': return .End_Key
-                    }
-                }
-            } else {
-                switch seq[1] {
-                case 'A': return .Arrow_Up
-                case 'B': return .Arrow_Down
-                case 'C': return .Arrow_Right
-                case 'D': return .Arrow_Left
-                case 'H': return .Home_Key
-                case 'F': return .End_Key
+        b, ok, timed_out := read_input()
+        if timed_out {
+            if rows, cols, wok := poll_window_size(); wok {
+                if rows != IDE.win_row || cols != IDE.win_col {
+                    return .Resize
                 }
             }
-        } else if (seq[0] == 'O') {
-            switch seq[1] {
-                case 'H': return .Home_Key
-                case 'F': return .End_Key
-            }
+            continue
         }
+        if !ok do die("read byte error")
+        if b == '\x1b' do return parse_escape()
+        if b == 127 do return .Backspace
+        return b
+    }
+}
+
+read_seq_byte :: proc() -> (byte, bool) {
+    b, ok, timed_out := read_input()
+    if timed_out || !ok do return 0, false
+    return b, true
+}
+
+xterm_mods :: proc(n: int) -> bit_set[Mod] {
+    // xterm modifier parameter is 1 + shift + 2*alt + 4*ctrl.
+    if n <= 1 do return {}
+    m := n - 1
+    r: bit_set[Mod]
+    if m & 1 != 0 do r += {.Shift}
+    if m & 2 != 0 do r += {.Alt}
+    if m & 4 != 0 do r += {.Ctrl}
+    return r
+}
+
+parse_escape :: proc() -> Key {
+    b, ok := read_seq_byte()
+    if !ok do return '\x1b'
+    if b == '[' do return parse_csi()
+    if b == 'O' do return parse_ss3()
+    key_mods += {.Alt}
+    if b == 127 do return .Backspace
+    return b
+}
+
+parse_ss3 :: proc() -> Key {
+    b, ok := read_seq_byte()
+    if !ok do return '\x1b'
+    switch b {
+    case 'A': return .Arrow_Up
+    case 'B': return .Arrow_Down
+    case 'C': return .Arrow_Right
+    case 'D': return .Arrow_Left
+    case 'H': return .Home_Key
+    case 'F': return .End_Key
+    case 'P': return .F1
+    case 'Q': return .F2
+    case 'R': return .F3
+    case 'S': return .F4
+    }
+    return '\x1b'
+}
+
+parse_csi :: proc() -> Key {
+    buf: [64]byte
+    n := 0
+    for n < len(buf) {
+        b, ok := read_seq_byte()
+        if !ok do return '\x1b'
+        buf[n] = b
+        n += 1
+        if b >= 0x40 && b <= 0x7E do break
+    }
+    if n == 0 do return '\x1b'
+    final := buf[n - 1]
+    params := string(buf[:n - 1])
+    if final == '~' && (params == "200" || strings.has_prefix(params, "200;")) {
+        read_bracketed_paste()
+        return .Paste
+    }
+
+    semi := strings.last_index(params, ";")
+    if semi >= 0 {
+        if mod_n, mok := strconv_parse_int(params[semi + 1:]); mok {
+            key_mods = xterm_mods(mod_n)
+        }
+    }
+    num_s := params
+    if semi >= 0 do num_s = params[:semi]
+    num, _ := strconv_parse_int(num_s)
+
+    if final == '~' {
+        switch num {
+        case 1, 7: return .Home_Key
+        case 3: return .Del_Key
+        case 4, 8: return .End_Key
+        case 5: return .Page_Up
+        case 6: return .Page_Down
+        case 11, 23: return .F1
+        case 12, 24: return .F2
+        case 13, 25: return .F3
+        case 14, 26: return .F4
+        case 15, 28: return .F5
+        case 17, 29: return .F6
+        case 18, 31: return .F7
+        case 19, 32: return .F8
+        case 20, 33: return .F9
+        case 21, 34: return .F10
+        }
+        // Shifted function keys are often reported as 25~ etc. Keep the key
+        // and the modifier already parsed from the second parameter.
         return '\x1b'
-    } else {
-        if c == 127 do return .Backspace
-        return c
+    }
+    switch final {
+    case 'A': return .Arrow_Up
+    case 'B': return .Arrow_Down
+    case 'C': return .Arrow_Right
+    case 'D': return .Arrow_Left
+    case 'H': return .Home_Key
+    case 'F': return .End_Key
+    case 'P': return .F1
+    case 'Q': return .F2
+    case 'R': return .F3
+    case 'S': return .F4
+    case:
+        return '\x1b'
+    }
+}
+
+// Local wrapper so this file does not need to import strconv just for CSI.
+strconv_parse_int :: proc(s: string) -> (int, bool) {
+    n := 0
+    if len(s) == 0 do return 0, false
+    for i in 0 ..< len(s) {
+        c := s[i]
+        if c < '0' || c > '9' do return 0, false
+        n = n * 10 + int(c - '0')
+    }
+    return n, true
+}
+
+read_bracketed_paste :: proc() {
+    clear(&paste_buf)
+    // Bracketed paste ends at ESC [ 201 ~
+    end := []byte{'\x1b', '[', '2', '0', '1', '~'}
+    raw := make([dynamic]byte, 0, 256)
+    defer delete(raw)
+    for len(raw) < 8 * 1024 * 1024 {
+        b, ok, timed_out := read_input()
+        if !ok && !timed_out do break
+        if timed_out do continue
+        append(&raw, b)
+        if len(raw) >= len(end) && string(raw[len(raw) - len(end):]) == string(end) {
+            resize(&raw, len(raw) - len(end))
+            break
+        }
+    }
+    for i := 0; i < len(raw); i += 1 {
+        if raw[i] == '\r' {
+            append(&paste_buf, '\n')
+            if i + 1 < len(raw) && raw[i + 1] == '\n' do i += 1
+        } else {
+            append(&paste_buf, raw[i])
+        }
     }
 }
 
 /*** input ***/
-
-move_cursor :: proc(key: Key) {
-    switch key {
-    case .Arrow_Left: 
-        if E.cx != 0 do E.cx -= 1
-        else if E.cy > 0 {  
-            E.cy -= 1
-            E.cx = E.row[E.cy].size
-        }
-    case .Arrow_Right: 
-        if E.cy < E.num_rows {
-            if E.cx < E.row[E.cy].size do E.cx += 1
-            else if E.cx == E.row[E.cy].size {
-                if E.cy < E.num_rows - 1 do E.cy, E.cx = E.cy + 1, 0
-            }
-        }
-    case .Arrow_Up: if E.cy != 0 do E.cy -= 1
-    case .Arrow_Down: if E.cy < E.num_rows do E.cy += 1
-    }
-    rowlen := 0
-    if E.cy < E.num_rows do rowlen = E.row[E.cy].size
-    if E.cx > rowlen do E.cx = rowlen
-}
 
 quit_times := Quit_Times
 
@@ -377,6 +573,7 @@ request_quit :: proc() {
 
 handle_keypress :: proc() {
     c := read_key()
+    if a, ok := c.(Arrow); ok && a == .Resize do return
 
     // Ctrl-Q is handled here (not in the IDE layer) because it is the only key
     // that must *not* reset `quit_times`: repeated presses have to accumulate.
@@ -384,71 +581,124 @@ handle_keypress :: proc() {
         request_quit()
         return
     }
+
+    if IDE.overlay == .Help {
+        help_on_key(c)
+        return
+    }
+    if IDE.overlay == .Recent {
+        recent_on_key(c)
+        return
+    }
     quit_times = Quit_Times
 
     if ide_handle_key(c) do return
+
+    extend := .Shift in key_mods
+    ctrl := .Ctrl in key_mods
     switch v in c {
     case Arrow:
         switch v {
-        case .Page_Up, .Page_Down: 
-            if c == .Page_Up do E.cy = E.rowoff
-            else if c == .Page_Down {
+        case .Page_Up, .Page_Down:
+            begin_move(extend)
+            if v == .Page_Up do E.cy = E.rowoff
+            else {
                 E.cy = E.rowoff + E.screen_row - 1
                 if E.cy > E.num_rows do E.cy = E.num_rows
             }
-            for _ in 0..<E.screen_row {
-                move_cursor(c == .Page_Up ? .Arrow_Up : .Arrow_Down)
-            }
-        case .Home_Key: E.cx = 0
-        case .End_Key: if E.cy < E.num_rows do E.cx = E.row[E.cy].size
-        case .Arrow_Up, .Arrow_Down, .Arrow_Left, .Arrow_Right: move_cursor(c)
-        case .Backspace, .Del_Key: 
-            if c == .Del_Key do move_cursor(.Arrow_Right)
-            del_char()
+            step := v == .Page_Up ? -1 : 1
+            for _ in 0 ..< E.screen_row do v_step(step, extend)
+        case .Home_Key:
+            if ctrl do jump_buffer_edge(true, extend)
+            else do move_home(extend)
+        case .End_Key:
+            if ctrl do jump_buffer_edge(false, extend)
+            else do move_end(extend)
+        case .Arrow_Left:
+            if ctrl do move_word(-1, extend)
+            else do h_step(-1, extend)
+        case .Arrow_Right:
+            if ctrl do move_word(1, extend)
+            else do h_step(1, extend)
+        case .Arrow_Up: v_step(-1, extend)
+        case .Arrow_Down: v_step(1, extend)
+        case .Backspace: backspace()
+        case .Del_Key: delete_forward()
+        case .F1, .F2, .F3, .F4, .F5, .F6, .F7, .F8, .F9, .F10, .F11, .F12, .Paste, .Resize:
         }
-    case byte: 
+    case byte:
+        if .Alt in key_mods do return
         switch v {
-        case '\r': insert_newline()
-        case cntl_key('h'): del_char()
-        case cntl_key('l'), '\x1b': 
+        case '\r': newline_indent()
+        case cntl_key('h'): backspace()
+        case '\x1b':
+            if E.sel_on do clear_sel()
         case cntl_key('f'): editor_find()
-        case: insert_char(v)
+        case cntl_key('z'): undo_edit()
+        case cntl_key('y'): redo_edit()
+        case cntl_key('a'): select_all()
+        case cntl_key('c'): copy_selection()
+        case cntl_key('x'): cut_selection()
+        case cntl_key('v'): paste_clip()
+        case cntl_key('d'): duplicate_line()
+        case cntl_key('l'): select_line()
+        case: if !is_cntl(v) do insert_char(v)
         }
-    } 
-    quit_times = Quit_Times
+    }
 }
 
-editor_prompt :: proc(prompt: string, callback: proc([]byte, Key) = nil) -> string {
+pop_prompt_rune :: proc(buf: ^[dynamic]byte) {
+    if len(buf) == 0 do return
+    resize(buf, prev_rune_start(buf[:], len(buf)))
+}
+
+// `ok` is false when the user cancels with Esc. An empty confirmation is
+// returned only when `allow_empty` is set.
+editor_prompt :: proc(prompt: string, callback: proc([]byte, Key) = nil, seed: string = "", allow_empty := false) -> (string, bool) {
     buf: [dynamic]byte
     defer delete(buf)
+    if len(seed) > 0 do append(&buf, ..str_bytes(seed))
     for {
-        set_status_message(prompt, string(buf[:]))
+        body := string(buf[:])
+        label := fmt.tprintf(prompt, body)
+        if strings.contains(prompt, "Search") || strings.contains(prompt, "Replace") {
+            mode := search_case ? "case-sensitive" : "case-insensitive"
+            label = fmt.tprintf("%s  [%s]", label, mode)
+        }
+        set_status_message("%s", label)
         refresh_screen()
 
         c := read_key()
+        if a, ok := c.(Arrow); ok && a == .Resize do continue
         switch v in c {
-        case Arrow: 
-            if v == .Del_Key || v == .Backspace {
-                if len(buf) > 0 do pop(&buf)
+        case Arrow:
+            if v == .Paste {
+                append(&buf, ..paste_buf[:])
+                clear(&paste_buf)
+            } else if v == .Del_Key || v == .Backspace {
+                pop_prompt_rune(&buf)
+            } else if v == .Arrow_Left || v == .Arrow_Right || v == .Arrow_Up || v == .Arrow_Down {
+                // delivered to the find callback below
             }
-        case byte: 
-            if v == cntl_key('h') {
-                if len(buf) > 0 do pop(&buf)
-            }
-            else if v == '\x1b' {
+        case byte:
+            if .Alt in key_mods && (v == 'c' || v == 'C') {
+                search_case = !search_case
+            } else if v == cntl_key('h') {
+                pop_prompt_rune(&buf)
+            } else if v == '\x1b' {
                 set_status_message("")
                 if callback != nil do callback(buf[:], c)
-                return ""
+                return "", false
             } else if v == '\r' {
-                if len(buf) != 0 {
+                if len(buf) != 0 || allow_empty {
                     set_status_message("")
                     if callback != nil do callback(buf[:], c)
-                    return strings.clone_from_bytes(buf[:])
+                    return strings.clone_from_bytes(buf[:]), true
                 }
-            } else if !is_cntl(v) && v < 128 {
+            } else if !is_cntl(v) {
                 append(&buf, v)
             }
-        } 
+        }
         if callback != nil do callback(buf[:], c)
     }
 }
@@ -460,8 +710,9 @@ editor_scroll :: proc() {
     if E.cy >= E.rowoff + E.screen_row do E.rowoff = E.cy - E.screen_row + 1
     line_len := get_num_len(f64(E.num_rows))
     text_width := E.screen_col - (line_len + 3)
+    if text_width < 1 do text_width = 1
     if E.rx < E.coloff do E.coloff = E.rx
-    if E.rx >= E.coloff + E.screen_col do E.coloff = E.rx - text_width + 1
+    if E.rx >= E.coloff + text_width do E.coloff = E.rx - text_width + 1
 }
 
 editor_update_row :: proc(row: ^E_Row) {
@@ -496,21 +747,47 @@ set_status_message :: proc(format: string, args: ..any) {
 
 /*** row operations ***/
 
+// Display columns from the start of the row up to byte offset `cx`.
+// Tabs expand to Tab_Stop. Every other codepoint, including CJK, is one column.
 row_cx_to_rx :: proc(row: ^E_Row, cx: int) -> int {
     rx := 0
-    for j := 0; j < cx; j += 1 {
-        if row.chars[j] == '\t' do rx += Tab_Stop - 1 - rx % Tab_Stop
+    j := 0
+    limit := cx
+    if limit > row.size do limit = row.size
+    if limit < 0 do limit = 0
+    for j < limit {
+        if row.chars[j] == '\t' {
+            rx += Tab_Stop - (rx % Tab_Stop)
+            j += 1
+            continue
+        }
+        _, n := utf8.decode_rune(row.chars[j:])
+        if n <= 0 do n = 1
+        if j + n > limit {
+            rx += 1
+            break
+        }
         rx += 1
+        j += n
     }
     return rx
 }
 
 row_rx_to_cx :: proc(row: ^E_Row, rx: int) -> int {
     cur_rx := 0
-    for i in 0..<row.size {
-        if row.chars[i] == '\t' do cur_rx += Tab_Stop - 1 - cur_rx % Tab_Stop
-        cur_rx += 1
-        if cur_rx > rx do return i 
+    j := 0
+    for j < row.size {
+        w := 1
+        n := 1
+        if row.chars[j] == '\t' {
+            w = Tab_Stop - (cur_rx % Tab_Stop)
+        } else {
+            _, n = utf8.decode_rune(row.chars[j:])
+            if n <= 0 do n = 1
+        }
+        if cur_rx + w > rx do return j
+        cur_rx += w
+        j += n
     }
     return row.size
 }
@@ -520,29 +797,6 @@ free_row :: proc(row: ^E_Row) {
     delete(row.chars)
     delete(row.hl)
 } 
-
-row_append_string :: proc(row: ^E_Row, s: []byte) {
-    append(&row.chars, ..s) 
-    row.size += len(s)
-    editor_update_row(row)
-    E.dirty += 1
-}
-
-row_insert_char :: proc(row: ^E_Row, at_: int, c: byte) {
-    at := at_ < 0 || at_ > row.size ? row.size : at_
-    inject_at(&row.chars, at, c)
-    row.size = len(row.chars)
-    editor_update_row(row)
-    E.dirty += 1
-}
-
-row_del_char :: proc(row: ^E_Row, at: int) {
-    if at < 0 || at >= row.size do return 
-    ordered_remove(&row.chars, at)
-    row.size = len(row.chars)
-    editor_update_row(row)
-    E.dirty += 1
-}
 
 del_row :: proc(at: int) {
     if at < 0 || at >= E.num_rows do return
@@ -557,47 +811,13 @@ insert_row :: proc(at: int, s: []byte) {
     if at < 0 || at > E.num_rows do return 
     new_row := E_Row {at, len(s), 0, slice.clone_to_dynamic(s), {}, {}, false}
     inject_at(&E.row, at, new_row)
-    for j in at+1..=E.num_rows do E.row[j].idx += 1
+    // `at+1..=E.num_rows` walks backward on the current compiler when the
+    // buffer was empty (1..=0), and indexes off the end. Only the rows that
+    // shifted right need a new index.
+    for j in at + 1 ..< len(E.row) do E.row[j].idx += 1
     editor_update_row(&E.row[at])
     E.num_rows += 1
     E.dirty += 1
-}
-
-/*** editor operations ***/
-
-insert_char :: proc(c: byte) {
-    if E.cy == E.num_rows do insert_row(E.num_rows, []byte{})
-    row_insert_char(&E.row[E.cy], E.cx, c)
-    E.cx += 1
-}
-
-insert_newline :: proc() {
-    if E.cx == 0 do insert_row(E.cy, []byte{})
-    else {
-        row := &E.row[E.cy]
-        insert_row(E.cy + 1, row.chars[E.cx:])
-        row = &E.row[E.cy]
-        resize(&row.chars, E.cx)
-        row.size = E.cx
-        editor_update_row(row)
-    }
-    E.cy += 1
-    E.cx = 0
-}
-
-del_char :: proc() {
-    if E.cy == E.num_rows do return
-    if E.cx == 0 && E.cy == 0 do return 
-    row := &E.row[E.cy]
-    if E.cx > 0 {
-        row_del_char(row, E.cx - 1)
-        E.cx -= 1
-    } else {
-        E.cx = E.row[E.cy - 1].size
-        row_append_string(&E.row[E.cy - 1], row.chars[:])
-        del_row(E.cy)
-        E.cy -= 1
-    }
 }
 
 /*** terminal ***/
@@ -616,73 +836,15 @@ exit :: proc(code: int) {
     os.exit(code)
 }
 
-/*** find ***/
-
-editor_find :: proc() {
-    saved_cx, saved_cy := E.cx, E.cy
-    saved_coloff, saved_rowoff := E.coloff, E.rowoff
-    query := editor_prompt("Search: %s (Use ESC/Arrow/Enter)", find_callback)
-    defer delete(query)
-    if query == "" {    // restore values when escape
-        E.cx, E.cy = saved_cx, saved_cy
-        E.coloff, E.rowoff = saved_coloff, saved_rowoff
-    }
-}
-
-last_match := -1
-direction := 1
-saved_hl_line := 0
-saved_hl := [dynamic]Highlight {}
-
-find_callback :: proc(query: []byte, key: Key) {
-    if len(saved_hl) != 0 {
-        copy(E.row[saved_hl_line].hl[:], saved_hl[:])
-        clear(&saved_hl)
-    }   
-
-    #partial switch v in key {
-    case byte:
-        if v == '\r' || v == '\x1b' {
-            last_match = -1
-            direction = 1
-            return
-        }
-    case Arrow:
-        if v == .Arrow_Right || v == .Arrow_Down do direction = 1
-        else if v == .Arrow_Left   || v == .Arrow_Up   do direction = -1
-    case:
-        last_match = -1
-        direction = 1
-    }
-
-    current := last_match
-    for i in 0..<E.num_rows {
-        current += direction
-        if current == -1 do current = E.num_rows - 1
-        else if current == E.num_rows do current = 0
-        row := &E.row[current]
-        idx := strings.index(string(row.render[:]), string(query))
-        if idx >= 0 {
-            last_match = current
-            E.cy = current
-            E.cx = row_rx_to_cx(row, idx)
-            E.rowoff = E.num_rows
-            saved_hl_line = current
-            resize(&saved_hl, row.rsize)
-            copy(saved_hl[:], row.hl[:])
-            for i in 0..<len(query) {
-                row.hl[idx + i] = .Hl_Match
-            }
-            break
-        }
-    }
-}
-
 /*** syntax highlighting ***/
 
 update_syntax :: proc(row: ^E_Row) {
     resize(&row.hl, row.rsize)
-    if E.syntax == nil do return 
+    if E.syntax == nil do return
+    if E.syntax.filetype == "markdown" {
+        update_markdown(row)
+        return
+    } 
     keywords := E.syntax.keywords
     scs := E.syntax.singleline_comment_start
     mcs := E.syntax.multiline_comment_start
@@ -801,14 +963,95 @@ is_separator :: proc(c: byte) -> bool {
     }
 }
 
+file_has_suffix :: proc(name, suf: string) -> bool {
+    if len(name) < len(suf) do return false
+    tail := name[len(name) - len(suf):]
+    when ODIN_OS == .Windows {
+        for i in 0 ..< len(suf) {
+            a, b := tail[i], suf[i]
+            if a >= 'A' && a <= 'Z' do a += 32
+            if b >= 'A' && b <= 'Z' do b += 32
+            if a != b do return false
+        }
+        return true
+    } else {
+        return tail == suf
+    }
+}
+
+base_is :: proc(name: string, opts: ..string) -> bool {
+    base := path_base(name)
+    for opt in opts {
+        when ODIN_OS == .Windows {
+            if len(base) != len(opt) do continue
+            same := true
+            for i in 0 ..< len(base) {
+                a, b := base[i], opt[i]
+                if a >= 'A' && a <= 'Z' do a += 32
+                if b >= 'A' && b <= 'Z' do b += 32
+                if a != b {
+                    same = false
+                    break
+                }
+            }
+            if same do return true
+        } else {
+            if base == opt do return true
+        }
+    }
+    return false
+}
+
+update_markdown :: proc(row: ^E_Row) {
+    for i in 0 ..< row.rsize do row.hl[i] = .Hl_Normal
+    line := row.render[:]
+    trim := 0
+    for trim < len(line) && (line[trim] == ' ' || line[trim] == '\t') do trim += 1
+    prev := row.idx > 0 && row.idx - 1 < E.num_rows && E.row[row.idx - 1].hl_open_comment
+    fence := trim + 2 < len(line) && line[trim] == '`' && line[trim + 1] == '`' && line[trim + 2] == '`'
+    if fence {
+        for i in 0 ..< row.rsize do row.hl[i] = .Hl_Comment
+        row.hl_open_comment = !prev
+        return
+    }
+    if prev {
+        for i in 0 ..< row.rsize do row.hl[i] = .Hl_Comment
+        row.hl_open_comment = true
+        return
+    }
+    row.hl_open_comment = false
+    if trim < len(line) && line[trim] == '#' {
+        for i in 0 ..< row.rsize do row.hl[i] = .Hl_Keyword1
+        return
+    }
+    in_code := false
+    for i in 0 ..< len(line) {
+        if line[i] == '`' {
+            row.hl[i] = .Hl_String
+            in_code = !in_code
+            continue
+        }
+        if in_code && i < len(row.hl) do row.hl[i] = .Hl_String
+    }
+}
+
 select_syntax_highlight :: proc() {
     E.syntax = nil
-    if E.filename == "" do return 
+    if E.filename == "" do return
+    if base_is(E.filename, "Makefile", "makefile", "GNUmakefile") {
+        for &e in Hl_Db {
+            if e.filetype == "make" {
+                E.syntax = &e
+                for r in 0 ..< E.num_rows do update_syntax(&E.row[r])
+                return
+            }
+        }
+    }
     for &e in Hl_Db {
         for ft in e.filematch {
-            if strings.has_suffix(E.filename, ft) {
+            if file_has_suffix(E.filename, ft) {
                 E.syntax = &e
-                for r in 0..<E.num_rows do update_syntax(&E.row[r])
+                for r in 0 ..< E.num_rows do update_syntax(&E.row[r])
                 return
             }
         }
@@ -840,6 +1083,9 @@ init_editor :: proc() {
     E.cx, E.cy, E.num_rows, E.rowoff, E.coloff, E.rx = 0, 0, 0, 0, 0, 0
     E.dirty, E.syntax = 0, nil
     E.filename, E.status_msg, E.status_msg_time = "", "", time.now()
+    E.crlf = ODIN_OS == .Windows
+    E.sel_on = false
+    E.want_rx = 0
     if get_window_size(&E) == .Err do die("get window size error")
     ide_init()   // the IDE layer derives the text area from the window size
 }
@@ -851,7 +1097,7 @@ main :: proc() {
 
     // Show the default hint first, so anything the command line reports
     // ("New file", "looks like a binary file", ...) is what the user ends up seeing.
-    set_status_message("Ctrl-B files | Ctrl-R build | Ctrl-O open | Ctrl-N buffer | Ctrl-Q quit")
+    set_status_message("Ctrl-S save | Ctrl-F find | Ctrl-Z undo | F1 help | Ctrl-Q quit")
 
     // `olio`            -> current directory as the project
     // `olio path/dir`   -> that directory as the project
